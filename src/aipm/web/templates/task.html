@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+
+{% block title %}{{ task.title }} — AIPM{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <a href="/" class="text-sm text-gray-400 hover:text-gray-200">&larr; Dashboard</a>
+    <span class="text-gray-600 mx-2">/</span>
+    <a href="/projects/{{ task.project_id }}" class="text-sm text-gray-400 hover:text-gray-200">{{ task.project_id }}</a>
+</div>
+
+<div class="bg-gray-900 rounded-lg border border-gray-800 p-6 mb-6">
+    <div class="flex items-start justify-between">
+        <div>
+            <h1 class="text-xl font-bold text-white">{{ task.title }}</h1>
+            <div class="text-sm text-gray-400 mt-1">
+                {{ task.id }} &middot;
+                <span class="status-{{ task.status.value }} font-medium uppercase">{{ task.status.value }}</span>
+            </div>
+        </div>
+        <div class="flex gap-2">
+            {% if task.status.value in ['backlog', 'failed'] %}
+            <button
+                hx-post="/api/tasks/{{ task.id }}/dispatch?model=sonnet"
+                hx-swap="none"
+                class="text-sm bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded transition">
+                Dispatch (Sonnet)
+            </button>
+            <button
+                hx-post="/api/tasks/{{ task.id }}/dispatch?model=opus"
+                hx-swap="none"
+                class="text-sm bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded transition">
+                Dispatch (Opus)
+            </button>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="flex gap-3 mt-4">
+        {% for label in task.labels %}
+        <span class="text-xs bg-gray-800 border border-gray-700 text-gray-300 px-2 py-1 rounded">{{ label }}</span>
+        {% endfor %}
+    </div>
+
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
+        <div>
+            <div class="text-xs text-gray-500 uppercase">Priority</div>
+            <div class="text-lg font-bold {% if task.priority_score >= 70 %}text-red-400{% elif task.priority_score >= 50 %}text-yellow-400{% else %}text-gray-300{% endif %}">
+                {{ task.priority_score }}
+            </div>
+        </div>
+        <div>
+            <div class="text-xs text-gray-500 uppercase">Complexity</div>
+            <div class="text-lg text-gray-300">{{ task.complexity.value if task.complexity else 'Unclassified' }}</div>
+        </div>
+        <div>
+            <div class="text-xs text-gray-500 uppercase">Model</div>
+            <div class="text-lg text-gray-300">{{ task.assigned_model or 'Unassigned' }}</div>
+        </div>
+        <div>
+            <div class="text-xs text-gray-500 uppercase">GitHub</div>
+            <a href="https://github.com/{{ task.project_id }}/issues/{{ task.github_number }}"
+               target="_blank"
+               class="text-lg text-blue-400 hover:underline">#{{ task.github_number }}</a>
+        </div>
+    </div>
+
+    {% if task.body %}
+    <div class="mt-4 pt-4 border-t border-gray-800">
+        <div class="text-xs text-gray-500 uppercase mb-2">Description</div>
+        <div class="text-sm text-gray-300 whitespace-pre-wrap max-h-64 overflow-y-auto">{{ task.body[:2000] }}</div>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Run History -->
+<h2 class="text-lg font-semibold text-white mb-3">Run History</h2>
+{% if runs %}
+<div class="space-y-3">
+    {% for run in runs %}
+    <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
+        <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <span class="status-{{ run.status.value }} font-medium text-sm uppercase">{{ run.status.value }}</span>
+                <span class="text-sm text-gray-400">
+                    {% if 'opus' in run.model_used %}
+                    <span class="w-2 h-2 bg-purple-500 rounded-full inline-block"></span>
+                    {% elif 'sonnet' in run.model_used %}
+                    <span class="w-2 h-2 bg-blue-500 rounded-full inline-block"></span>
+                    {% else %}
+                    <span class="w-2 h-2 bg-green-500 rounded-full inline-block"></span>
+                    {% endif %}
+                    {{ run.model_used }}
+                </span>
+                <span class="text-sm text-gray-500">via {{ run.execution_mode }}</span>
+            </div>
+            <div class="text-sm text-gray-400">
+                {{ run.duration_seconds }}s &middot; ${{ "%.3f"|format(run.cost_usd) }}
+            </div>
+        </div>
+        {% if run.branch_name %}
+        <div class="text-xs text-gray-500 mt-2">Branch: {{ run.branch_name }}</div>
+        {% endif %}
+        {% if run.pr_url %}
+        <div class="text-xs mt-1">
+            <a href="{{ run.pr_url }}" target="_blank" class="text-blue-400 hover:underline">View Pull Request</a>
+        </div>
+        {% endif %}
+        {% if run.result_summary %}
+        <div class="text-xs text-gray-400 mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap">{{ run.result_summary[:500] }}</div>
+        {% endif %}
+        {% if run.error_message %}
+        <div class="text-xs text-red-400 mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap">{{ run.error_message[:500] }}</div>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="bg-gray-900 rounded-lg border border-gray-800 p-8 text-center text-gray-500">
+    No runs yet. Dispatch this task to start working on it.
+</div>
+{% endif %}
+{% endblock %}

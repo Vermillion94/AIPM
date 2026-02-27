@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+
+{% block content %}
+<!-- Stats bar -->
+<div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8" hx-get="/api/stats" hx-trigger="every 30s" hx-swap="none">
+    <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-400 uppercase tracking-wider">Projects</div>
+        <div class="text-2xl font-bold text-white mt-1">{{ stats.project_count }}</div>
+    </div>
+    <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-400 uppercase tracking-wider">Backlog</div>
+        <div class="text-2xl font-bold text-yellow-400 mt-1">{{ stats.task_counts.get('backlog', 0) }}</div>
+    </div>
+    <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-400 uppercase tracking-wider">In Progress</div>
+        <div class="text-2xl font-bold text-blue-400 mt-1">{{ stats.active_runs }}</div>
+    </div>
+    <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-400 uppercase tracking-wider">Completed</div>
+        <div class="text-2xl font-bold text-green-400 mt-1">{{ stats.task_counts.get('done', 0) }}</div>
+    </div>
+    <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-400 uppercase tracking-wider">Daily Spend</div>
+        <div class="text-2xl font-bold text-white mt-1">${{ "%.2f"|format(stats.daily_spend_usd) }}</div>
+    </div>
+</div>
+
+<!-- Projects -->
+<div class="mb-8">
+    <h2 class="text-lg font-semibold text-white mb-3">Projects</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {% for project in projects %}
+        <a href="/projects/{{ project.id }}" class="bg-gray-900 rounded-lg p-4 border border-gray-800 hover:border-gray-600 transition">
+            <div class="font-medium text-white">{{ project.display_name or project.id }}</div>
+            <div class="text-sm text-gray-400 mt-1">
+                {{ project.owner }}/{{ project.repo }}
+                {% if project.last_synced %}
+                <span class="text-xs text-gray-500 ml-2">synced {{ project.last_synced }}</span>
+                {% endif %}
+            </div>
+            <div class="flex gap-2 mt-2">
+                <span class="text-xs bg-gray-800 px-2 py-0.5 rounded text-gray-300">Priority: {{ project.priority_weight }}</span>
+                {% if project.test_command %}
+                <span class="text-xs bg-gray-800 px-2 py-0.5 rounded text-gray-300">Tests: {{ project.test_command }}</span>
+                {% endif %}
+            </div>
+        </a>
+        {% endfor %}
+        {% if not projects %}
+        <div class="text-gray-500 col-span-3">No projects configured. Add projects to config.toml and run 'aipm sync'.</div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Active Runs -->
+{% if runs %}
+<div class="mb-8">
+    <h2 class="text-lg font-semibold text-white mb-3">Recent Runs</h2>
+    <div class="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
+        <table class="w-full text-sm">
+            <thead class="bg-gray-800">
+                <tr>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Task</th>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Model</th>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Status</th>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Duration</th>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Cost</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for run in runs %}
+                <tr class="border-t border-gray-800 hover:bg-gray-800/50">
+                    <td class="px-4 py-2">
+                        <a href="/tasks/{{ run.task_id }}" class="text-blue-400 hover:underline">{{ run.task_id }}</a>
+                    </td>
+                    <td class="px-4 py-2 text-gray-300">
+                        <span class="inline-flex items-center gap-1">
+                            {% if 'opus' in run.model_used %}
+                            <span class="w-2 h-2 bg-purple-500 rounded-full"></span>
+                            {% elif 'sonnet' in run.model_used %}
+                            <span class="w-2 h-2 bg-blue-500 rounded-full"></span>
+                            {% else %}
+                            <span class="w-2 h-2 bg-green-500 rounded-full"></span>
+                            {% endif %}
+                            {{ run.model_used }}
+                        </span>
+                    </td>
+                    <td class="px-4 py-2">
+                        <span class="status-{{ run.status.value }}">{{ run.status.value }}</span>
+                    </td>
+                    <td class="px-4 py-2 text-gray-400">{{ run.duration_seconds }}s</td>
+                    <td class="px-4 py-2 text-gray-400">${{ "%.3f"|format(run.cost_usd) }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+<!-- Task Queue -->
+<div>
+    <h2 class="text-lg font-semibold text-white mb-3">Task Queue</h2>
+    <div class="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
+        <table class="w-full text-sm">
+            <thead class="bg-gray-800">
+                <tr>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Issue</th>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Title</th>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Status</th>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Model</th>
+                    <th class="text-right px-4 py-2 text-gray-400 font-medium">Priority</th>
+                    <th class="text-left px-4 py-2 text-gray-400 font-medium">Labels</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for task in tasks %}
+                <tr class="border-t border-gray-800 hover:bg-gray-800/50">
+                    <td class="px-4 py-2">
+                        <a href="/tasks/{{ task.id }}" class="text-blue-400 hover:underline">{{ task.id }}</a>
+                    </td>
+                    <td class="px-4 py-2 text-gray-200 max-w-xs truncate">{{ task.title }}</td>
+                    <td class="px-4 py-2">
+                        <span class="status-{{ task.status.value }} text-xs font-medium uppercase">{{ task.status.value }}</span>
+                    </td>
+                    <td class="px-4 py-2 text-gray-300">{{ task.assigned_model or '-' }}</td>
+                    <td class="px-4 py-2 text-right">
+                        <span class="{% if task.priority_score >= 70 %}text-red-400{% elif task.priority_score >= 50 %}text-yellow-400{% else %}text-gray-400{% endif %}">
+                            {{ task.priority_score }}
+                        </span>
+                    </td>
+                    <td class="px-4 py-2">
+                        {% for label in task.labels[:3] %}
+                        <span class="inline-block text-xs bg-gray-800 text-gray-300 px-1.5 py-0.5 rounded mr-1">{{ label }}</span>
+                        {% endfor %}
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not tasks %}
+                <tr>
+                    <td colspan="6" class="px-4 py-8 text-center text-gray-500">No tasks yet. Run 'aipm sync' to fetch issues.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

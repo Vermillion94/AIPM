@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.display_name or project.id }} — AIPM{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <a href="/" class="text-sm text-gray-400 hover:text-gray-200">&larr; Dashboard</a>
+    <h1 class="text-2xl font-bold text-white mt-2">{{ project.display_name or project.id }}</h1>
+    <div class="text-sm text-gray-400 mt-1">
+        {{ project.owner }}/{{ project.repo }}
+        {% if project.last_synced %}
+        &middot; Last synced: {{ project.last_synced }}
+        {% endif %}
+    </div>
+    <div class="flex gap-3 mt-3">
+        {% if project.test_command %}
+        <span class="text-xs bg-gray-800 border border-gray-700 px-2 py-1 rounded text-gray-300">Test: {{ project.test_command }}</span>
+        {% endif %}
+        {% if project.build_command %}
+        <span class="text-xs bg-gray-800 border border-gray-700 px-2 py-1 rounded text-gray-300">Build: {{ project.build_command }}</span>
+        {% endif %}
+        <span class="text-xs bg-gray-800 border border-gray-700 px-2 py-1 rounded text-gray-300">Priority: {{ project.priority_weight }}</span>
+    </div>
+</div>
+
+<div class="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
+    <table class="w-full text-sm">
+        <thead class="bg-gray-800">
+            <tr>
+                <th class="text-left px-4 py-2 text-gray-400 font-medium">#</th>
+                <th class="text-left px-4 py-2 text-gray-400 font-medium">Title</th>
+                <th class="text-left px-4 py-2 text-gray-400 font-medium">Status</th>
+                <th class="text-left px-4 py-2 text-gray-400 font-medium">Complexity</th>
+                <th class="text-left px-4 py-2 text-gray-400 font-medium">Model</th>
+                <th class="text-right px-4 py-2 text-gray-400 font-medium">Priority</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for task in tasks %}
+            <tr class="border-t border-gray-800 hover:bg-gray-800/50">
+                <td class="px-4 py-2 text-gray-400">
+                    <a href="/tasks/{{ task.id }}" class="text-blue-400 hover:underline">#{{ task.github_number }}</a>
+                </td>
+                <td class="px-4 py-2 text-gray-200">{{ task.title }}</td>
+                <td class="px-4 py-2">
+                    <span class="status-{{ task.status.value }} text-xs font-medium uppercase">{{ task.status.value }}</span>
+                </td>
+                <td class="px-4 py-2 text-gray-400">{{ task.complexity.value if task.complexity else '-' }}</td>
+                <td class="px-4 py-2 text-gray-300">{{ task.assigned_model or '-' }}</td>
+                <td class="px-4 py-2 text-right text-gray-300">{{ task.priority_score }}</td>
+            </tr>
+            {% endfor %}
+            {% if not tasks %}
+            <tr>
+                <td colspan="6" class="px-4 py-8 text-center text-gray-500">No issues found for this project.</td>
+            </tr>
+            {% endif %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

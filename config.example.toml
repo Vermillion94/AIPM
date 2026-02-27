@@ -1,0 +1,46 @@
+[aipm]
+data_dir = "./data"
+max_concurrent_workers = 2
+sync_interval_seconds = 300
+work_interval_seconds = 60
+max_retries_per_issue = 2
+
+[budget]
+daily_api_budget_usd = 10.0
+prefer_subscription = true
+per_task_budget_usd = 3.0
+
+[github]
+# Token loaded from GITHUB_TOKEN env var
+
+[[github.projects]]
+repo = "owner/repo-name"
+labels = ["bug", "enhancement", "ai-ready"]
+priority = 10
+test_command = "npm test"
+build_command = "npm run build"
+
+[[github.projects]]
+repo = "owner/another-repo"
+labels = []
+priority = 5
+test_command = "pytest"
+
+[anthropic]
+# API key loaded from ANTHROPIC_API_KEY env var
+
+[models]
+triage = "claude-haiku-4-5-20251001"
+routing = "claude-opus-4-6"
+coding_simple = "claude-sonnet-4-6"
+coding_complex = "claude-opus-4-6"
+review = "claude-opus-4-6"
+
+[telegram]
+# bot_token loaded from TELEGRAM_BOT_TOKEN env var
+# chat_id loaded from TELEGRAM_CHAT_ID env var
+enabled = true
+
+[dashboard]
+host = "0.0.0.0"
+port = 8000
