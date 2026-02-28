@@ -13,6 +13,7 @@ from ..config import Settings
 from ..db.models import RunStatus, Task, TaskStatus, WorkRun
 from ..db.store import Store
 from ..prompts.coding import build_coding_prompt, build_retry_prompt
+from .budget import BudgetTracker
 
 logger = logging.getLogger("aipm.core.worker")
 
@@ -23,6 +24,7 @@ class Worker:
     def __init__(self, settings: Settings, store: Store):
         self.settings = settings
         self.store = store
+        self.budget = BudgetTracker(settings, store)
 
     async def execute(
         self,
@@ -34,7 +36,6 @@ class Worker:
     ) -> WorkRun:
         """Execute a task and return the work run result."""
         # Parse project info
-        parts = task.project_id.split("/")
         project_repo = task.project_id
 
         # Create the work run record
@@ -59,6 +60,19 @@ class Worker:
             approach=approach,
         )
 
+        # Check for previous failed runs and inject retry context
+        failed_count = await self.store.count_failed_runs(task.id)
+        if failed_count > 0:
+            latest_failed = await self.store.get_latest_failed_run(task.id)
+            if latest_failed:
+                error_output = latest_failed.error_message or latest_failed.result_summary or "Unknown error"
+                prompt = build_retry_prompt(
+                    original_prompt=prompt,
+                    error_output=error_output,
+                    attempt=failed_count + 1,
+                )
+                logger.info(f"Retry attempt {failed_count + 1} for task {task.id}")
+
         # Set task to in_progress
         await self.store.update_task_status(task.id, TaskStatus.IN_PROGRESS)
 
@@ -66,9 +80,9 @@ class Worker:
 
         try:
             if execution_mode == "cli":
-                result = await self._execute_cli(prompt, worktree_path, model)
+                result = await self._execute_cli(prompt, worktree_path, model, run_id)
             else:
-                result = await self._execute_sdk(prompt, worktree_path, model)
+                result = await self._execute_sdk(prompt, worktree_path, model, run_id)
 
             duration = int(time.time() - start_time)
 
@@ -78,6 +92,9 @@ class Worker:
                     status=RunStatus.SUCCEEDED,
                     result_summary=result.get("summary", "Task completed"),
                     duration_seconds=duration,
+                    tokens_in=result.get("tokens_in", 0),
+                    tokens_out=result.get("tokens_out", 0),
+                    cost_usd=result.get("cost_usd", 0.0),
                 )
                 logger.info(f"Worker completed task {task.id} in {duration}s")
             else:
@@ -86,6 +103,9 @@ class Worker:
                     status=RunStatus.FAILED,
                     error_message=result.get("error", "Unknown error"),
                     duration_seconds=duration,
+                    tokens_in=result.get("tokens_in", 0),
+                    tokens_out=result.get("tokens_out", 0),
+                    cost_usd=result.get("cost_usd", 0.0),
                 )
                 logger.error(f"Worker failed task {task.id}: {result.get('error')}")
 
@@ -104,7 +124,7 @@ class Worker:
         return updated_run or run
 
     async def _execute_cli(
-        self, prompt: str, worktree_path: Path, model: str
+        self, prompt: str, worktree_path: Path, model: str, run_id: str
     ) -> dict:
         """Execute via Claude Code CLI (uses subscription credits)."""
         # Map model names to CLI model flags
@@ -151,17 +171,39 @@ class Worker:
                 f"=== STDOUT ===\n{stdout_text}\n\n=== STDERR ===\n{stderr_text}"
             )
 
+            # Estimate tokens from text length for CLI mode (no actual usage data)
+            # Rough heuristic: ~4 chars per token
+            tokens_in = len(prompt) // 4
+            tokens_out = len(stdout_text) // 4
+            cost_usd = self.budget.estimate_cost(model, tokens_in, tokens_out)
+
+            # Record credit usage
+            await self.store.record_credit(
+                run_id=run_id,
+                model=model,
+                source="cli",
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost_usd,
+            )
+
             if proc.returncode == 0:
                 return {
                     "success": True,
                     "summary": stdout_text[-500:] if stdout_text else "Completed",
                     "log_path": str(log_file),
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "cost_usd": cost_usd,
                 }
             else:
                 return {
                     "success": False,
                     "error": stderr_text[-1000:] if stderr_text else f"Exit code {proc.returncode}",
                     "log_path": str(log_file),
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "cost_usd": cost_usd,
                 }
 
         except asyncio.TimeoutError:
@@ -173,7 +215,7 @@ class Worker:
             }
 
     async def _execute_sdk(
-        self, prompt: str, worktree_path: Path, model: str
+        self, prompt: str, worktree_path: Path, model: str, run_id: str
     ) -> dict:
         """Execute via Anthropic SDK (uses API tokens).
 
@@ -184,16 +226,41 @@ class Worker:
             from ..integrations.anthropic_client import AnthropicClient
 
             client = AnthropicClient(self.settings)
-            response = client.generate(
-                prompt=prompt,
-                model=model,
+
+            # Use raw API call to capture usage
+            import anthropic
+
+            api_client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key)
+            message = api_client.messages.create(
+                model=model if model.startswith("claude-") else f"claude-{model}-4-6",
                 max_tokens=4096,
                 system="You are a skilled software engineer. Provide the code changes needed to resolve the issue. Show the full file contents for each file that needs to change.",
+                messages=[{"role": "user", "content": prompt}],
             )
+
+            # Extract actual usage from API response
+            tokens_in = message.usage.input_tokens
+            tokens_out = message.usage.output_tokens
+            cost_usd = self.budget.estimate_cost(model, tokens_in, tokens_out)
+
+            # Record credit usage
+            await self.store.record_credit(
+                run_id=run_id,
+                model=model,
+                source="sdk",
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost_usd,
+            )
+
+            response_text = message.content[0].text if message.content else ""
 
             return {
                 "success": True,
-                "summary": response[:500] if response else "Completed",
+                "summary": response_text[:500] if response_text else "Completed",
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "cost_usd": cost_usd,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
 from ..config import Settings
+from ..db.models import TaskStatus
 from ..db.store import Store
 
 logger = logging.getLogger("aipm.integrations.telegram")
@@ -19,6 +21,7 @@ class TelegramNotifier:
         self.store = store
         self._bot = None
         self._app = None
+        self._pause_event: Optional[asyncio.Event] = None
 
     @property
     def enabled(self) -> bool:
@@ -27,6 +30,10 @@ class TelegramNotifier:
             and self.settings.telegram.bot_token
             and self.settings.telegram.chat_id
         )
+
+    def set_pause_event(self, event: asyncio.Event) -> None:
+        """Set the shared pause/resume event from the scheduler."""
+        self._pause_event = event
 
     async def initialize(self) -> bool:
         """Initialize the Telegram bot. Returns True if successful."""
@@ -218,8 +225,11 @@ class TelegramNotifier:
     async def _cmd_status(self, update, context) -> None:
         """Handle /status command."""
         stats = await self.store.get_stats()
+        paused = self._pause_event and not self._pause_event.is_set()
+        scheduler_state = "PAUSED" if paused else "RUNNING"
         text = (
             f"<b>AIPM Status</b>\n\n"
+            f"Scheduler: {scheduler_state}\n"
             f"Projects: {stats['project_count']}\n"
             f"Active runs: {stats['active_runs']}\n"
             f"Total runs: {stats['total_runs']}\n"
@@ -233,11 +243,21 @@ class TelegramNotifier:
 
     async def _cmd_pause(self, update, context) -> None:
         """Handle /pause command — pause the scheduler."""
-        await update.message.reply_text("Scheduler paused. Use /resume to continue.")
+        if self._pause_event:
+            self._pause_event.clear()
+            await update.message.reply_text("Scheduler paused. Use /resume to continue.")
+            logger.info("Scheduler paused via Telegram /pause command")
+        else:
+            await update.message.reply_text("Pause not available — scheduler not connected.")
 
     async def _cmd_resume(self, update, context) -> None:
         """Handle /resume command — resume the scheduler."""
-        await update.message.reply_text("Scheduler resumed.")
+        if self._pause_event:
+            self._pause_event.set()
+            await update.message.reply_text("Scheduler resumed.")
+            logger.info("Scheduler resumed via Telegram /resume command")
+        else:
+            await update.message.reply_text("Resume not available — scheduler not connected.")
 
     async def _handle_callback(self, update, context) -> None:
         """Handle inline keyboard button presses for decisions."""
@@ -250,7 +270,49 @@ class TelegramNotifier:
             if len(parts) >= 3:
                 task_id = parts[1]
                 choice_idx = int(parts[2])
-                await query.edit_message_text(
-                    f"Decision recorded for {task_id}: option {choice_idx}"
+
+                # Look up the pending decision for this task
+                decision = await self.store.get_pending_decision_for_task(task_id)
+                if not decision:
+                    await query.edit_message_text(
+                        f"No pending decision found for task {task_id}."
+                    )
+                    return
+
+                # Resolve the option text
+                if 0 <= choice_idx < len(decision.options):
+                    choice = decision.options[choice_idx]
+                else:
+                    choice = f"option_{choice_idx}"
+
+                # Resolve the decision in the database
+                await self.store.resolve_decision(decision.id, choice)
+
+                logger.info(
+                    f"Decision resolved for task {task_id}: {choice}"
                 )
-                logger.info(f"Decision received: {task_id} -> {choice_idx}")
+
+                # Handle the decision outcome
+                if choice in ("Approve", "Retry with different model"):
+                    # Re-queue the task to BACKLOG for processing
+                    await self.store.update_task_status(task_id, TaskStatus.BACKLOG)
+                    await query.edit_message_text(
+                        f"Approved: task {task_id} re-queued to backlog.\n"
+                        f"Decision: {choice}"
+                    )
+                elif choice == "Skip this issue":
+                    await self.store.update_task_status(task_id, TaskStatus.FAILED)
+                    await query.edit_message_text(
+                        f"Skipped: task {task_id} marked as failed.\n"
+                        f"Decision: {choice}"
+                    )
+                elif choice == "Assign to human":
+                    # Keep as NEEDS_HUMAN
+                    await query.edit_message_text(
+                        f"Assigned to human: task {task_id}\n"
+                        f"Decision: {choice}"
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"Decision recorded for {task_id}: {choice}"
+                    )

@@ -5,17 +5,28 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..config import Settings
-from ..db.models import RunStatus, TaskStatus
+from ..db.models import (
+    Complexity,
+    Decision,
+    DecisionStatus,
+    RunStatus,
+    TaskStatus,
+)
 from ..db.store import Store
+from ..github.actions import GitHubActions
 from ..github.sync import GitHubSync
 from .budget import BudgetTracker
 from .qa import QARunner
 from .router import TaskRouter
 from .worker import Worker
 from .worktree import WorktreeManager
+
+if TYPE_CHECKING:
+    from ..db.models import Task, WorkRun
+    from ..integrations.telegram_bot import TelegramNotifier
 
 logger = logging.getLogger("aipm.core.scheduler")
 
@@ -32,10 +43,23 @@ class Scheduler:
         self.worker = Worker(settings, store)
         self.qa = QARunner(settings, store)
         self.worktree_mgr = WorktreeManager(settings.worktrees_path)
+        self.github_actions = GitHubActions(settings)
         self._running = False
 
+        # Pause event: set = running, cleared = paused
+        self.pause_event = asyncio.Event()
+        self.pause_event.set()  # starts running
+
+        # Optional Telegram notifier (wired by daemon)
+        self._telegram: Optional[TelegramNotifier] = None
+        self._budget_warning_sent = False
+
+    def set_telegram(self, telegram: TelegramNotifier) -> None:
+        """Set the Telegram notifier for sending notifications."""
+        self._telegram = telegram
+
     async def run_once(self) -> dict:
-        """Run a single cycle: sync → pick task → execute → QA.
+        """Run a single cycle: sync → pick task → execute → QA → publish.
 
         Returns a summary dict of what happened.
         """
@@ -54,6 +78,7 @@ class Scheduler:
         if not budget_status.can_work:
             logger.info(f"Budget exhausted: {budget_status.reason}")
             summary["budget_exhausted"] = True
+            await self._notify_budget_warning(budget_status.daily_spent, budget_status.daily_limit)
             return summary
 
         # 3. Check worker slots
@@ -73,6 +98,19 @@ class Scheduler:
         # 5. Classify and route
         complexity, model = await self.router.classify_and_route(task)
         logger.info(f"Routing task {task.id} → {model} (complexity: {complexity.value})")
+
+        # 5b. Complex task gate: request human approval before first execution
+        if complexity == Complexity.COMPLEX:
+            failed_count = await self.store.count_failed_runs(task.id)
+            if failed_count == 0:
+                # First attempt on a complex task — request approval
+                await self._request_decision(
+                    task,
+                    question=f"Complex task detected (model: {model}). Approve execution?",
+                    options=["Approve", "Skip", "Assign to human"],
+                )
+                summary["decision_requested"] = True
+                return summary
 
         # 6. Create worktree
         project = await self.store.get_project(task.project_id)
@@ -114,13 +152,16 @@ class Scheduler:
             }
 
             if qa_result.passed:
-                await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
-                logger.info(f"Task {task.id} completed and passed QA!")
+                # Publish results: push branch → create PR → comment on issue
+                await self._publish_results(task, run, project, worktree_path, branch_name)
+                logger.info(f"Task {task.id} completed, passed QA, and published!")
+                # Notify success
+                await self._notify_success(task, run)
             else:
-                await self.store.update_task_status(task.id, TaskStatus.FAILED)
+                await self._handle_failure(task, run)
                 logger.warning(f"Task {task.id} failed QA: {qa_result.issues}")
         else:
-            await self.store.update_task_status(task.id, TaskStatus.FAILED)
+            await self._handle_failure(task, run)
 
         return summary
 
@@ -136,6 +177,12 @@ class Scheduler:
 
         while self._running:
             try:
+                # Check pause state
+                if not self.pause_event.is_set():
+                    logger.info("Scheduler paused, waiting for resume...")
+                    await self.pause_event.wait()
+                    logger.info("Scheduler resumed")
+
                 import time
                 now = time.time()
 
@@ -151,12 +198,19 @@ class Scheduler:
                 # Try to dispatch work
                 budget_status = await self.budget.check_budget()
                 if budget_status.can_work:
+                    # Reset budget warning flag when budget is available again
+                    self._budget_warning_sent = False
+
                     active_runs = await self.store.count_active_runs()
                     if active_runs < self.settings.aipm.max_concurrent_workers:
                         task = await self.store.get_next_task()
                         if task:
                             # Run work in background
                             asyncio.create_task(self._work_on_task(task))
+                else:
+                    await self._notify_budget_warning(
+                        budget_status.daily_spent, budget_status.daily_limit
+                    )
 
                 await asyncio.sleep(work_interval)
 
@@ -172,15 +226,29 @@ class Scheduler:
     async def stop(self) -> None:
         """Stop the scheduling loop."""
         self._running = False
+        # Unblock the pause event so the loop can exit
+        self.pause_event.set()
         await self.github_sync.close()
+        await self.github_actions.close()
 
-    async def _work_on_task(self, task) -> None:
+    async def _work_on_task(self, task: Task) -> None:
         """Background task to work on a single issue."""
         try:
             complexity, model = await self.router.classify_and_route(task)
             project = await self.store.get_project(task.project_id)
             if not project:
                 return
+
+            # Complex task gate for background work
+            if complexity == Complexity.COMPLEX:
+                failed_count = await self.store.count_failed_runs(task.id)
+                if failed_count == 0:
+                    await self._request_decision(
+                        task,
+                        question=f"Complex task detected (model: {model}). Approve execution?",
+                        options=["Approve", "Skip", "Assign to human"],
+                    )
+                    return
 
             repo_url = f"https://github.com/{project.owner}/{project.repo}"
             branch_name = f"aipm/issue-{task.github_number}"
@@ -208,12 +276,196 @@ class Scheduler:
                     worktree_path, run, project.test_command
                 )
                 if qa_result.passed:
-                    await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
+                    await self._publish_results(task, run, project, worktree_path, branch_name)
+                    await self._notify_success(task, run)
                 else:
-                    await self.store.update_task_status(task.id, TaskStatus.FAILED)
+                    await self._handle_failure(task, run)
             else:
-                await self.store.update_task_status(task.id, TaskStatus.FAILED)
+                await self._handle_failure(task, run)
 
         except Exception as e:
             logger.exception(f"Background work failed for {task.id}: {e}")
             await self.store.update_task_status(task.id, TaskStatus.FAILED)
+
+    # --- PR Creation (Gap 3) ---
+
+    async def _publish_results(
+        self,
+        task: Task,
+        run: WorkRun,
+        project,
+        worktree_path: Path,
+        branch_name: str,
+    ) -> None:
+        """After QA passes: push branch → create PR → comment on issue → update run."""
+        try:
+            # Push branch
+            pushed = await self.github_actions.push_branch(
+                str(worktree_path), branch_name
+            )
+            if not pushed:
+                logger.error(f"Failed to push branch {branch_name} for task {task.id}")
+                await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
+                return
+
+            # Create PR
+            pr_title = f"[AIPM] Fix #{task.github_number}: {task.title}"
+            pr_body = (
+                f"Automated fix for #{task.github_number}\n\n"
+                f"**Issue:** {task.title}\n"
+                f"**Model:** {run.model_used}\n"
+                f"**Duration:** {run.duration_seconds}s\n\n"
+                f"---\n"
+                f"*Generated by AIPM*"
+            )
+
+            pr_data = await self.github_actions.create_pull_request(
+                owner=project.owner,
+                repo=project.repo,
+                title=pr_title,
+                body=pr_body,
+                head_branch=branch_name,
+                base_branch=project.default_branch,
+            )
+
+            if pr_data:
+                pr_url = pr_data.get("html_url", "")
+                pr_number = pr_data.get("number", 0)
+
+                # Update run with PR info
+                await self.store.update_run(
+                    run.id, pr_url=pr_url, pr_number=pr_number
+                )
+
+                # Comment on the original issue
+                await self.github_actions.comment_on_issue(
+                    owner=project.owner,
+                    repo=project.repo,
+                    issue_number=task.github_number,
+                    body=f"AIPM has created a pull request to address this issue: #{pr_number}\n\n"
+                         f"Model used: {run.model_used}",
+                )
+
+                logger.info(f"Published PR #{pr_number} for task {task.id}")
+
+            # Mark task as DONE
+            await self.store.update_task_status(task.id, TaskStatus.DONE)
+
+        except Exception as e:
+            logger.error(f"Failed to publish results for {task.id}: {e}")
+            # Still mark as IN_REVIEW so it's not lost
+            await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
+
+    # --- Retry Logic (Gap 4) ---
+
+    def _should_retry(self, failed_count: int) -> bool:
+        """Check if a task should be retried based on failure count."""
+        max_retries = self.settings.aipm.max_retries_per_issue
+        return failed_count < max_retries
+
+    async def _handle_failure(self, task: Task, run: WorkRun) -> None:
+        """Handle a failed task: retry or escalate."""
+        failed_count = await self.store.count_failed_runs(task.id)
+
+        if self._should_retry(failed_count):
+            # Reset to BACKLOG for retry
+            await self.store.update_task_status(task.id, TaskStatus.BACKLOG)
+            logger.info(
+                f"Task {task.id} failed (attempt {failed_count}/"
+                f"{self.settings.aipm.max_retries_per_issue}), "
+                f"returning to backlog for retry"
+            )
+        else:
+            # Retries exhausted — request human decision
+            await self.store.update_task_status(task.id, TaskStatus.FAILED)
+            logger.warning(
+                f"Task {task.id} failed after {failed_count} attempts, "
+                f"requesting human decision"
+            )
+            await self._request_decision(
+                task,
+                question=(
+                    f"Task failed after {failed_count} attempts. "
+                    f"Last error: {(run.error_message or 'Unknown')[:200]}"
+                ),
+                options=[
+                    "Retry with different model",
+                    "Skip this issue",
+                    "Assign to human",
+                ],
+                run_id=run.id,
+            )
+            # Notify failure
+            await self._notify_failure(task, run)
+
+    # --- Decision Creation (Gap 8) ---
+
+    async def _request_decision(
+        self,
+        task: Task,
+        question: str,
+        options: list[str],
+        run_id: Optional[str] = None,
+    ) -> None:
+        """Create a decision record, set task to NEEDS_HUMAN, and send Telegram notification."""
+        decision = Decision(
+            id="",
+            task_id=task.id,
+            run_id=run_id,
+            question=question,
+            options=options,
+            status=DecisionStatus.PENDING,
+        )
+        decision_id = await self.store.create_decision(decision)
+
+        await self.store.update_task_status(task.id, TaskStatus.NEEDS_HUMAN)
+
+        # Send Telegram notification
+        if self._telegram:
+            msg_id = await self._telegram.notify_decision_needed(
+                task_id=task.id,
+                title=task.title,
+                question=question,
+                options=options,
+            )
+            if msg_id:
+                # Store the telegram message ID on the decision for callback routing
+                await self.store.resolve_decision(decision_id, "")
+                # Re-create as pending with telegram_message_id
+                # (since resolve_decision marks as answered, we need to update directly)
+                await self.store.db.execute(
+                    "UPDATE decisions SET status = 'pending', decision = NULL, "
+                    "telegram_message_id = ?, answered_at = NULL WHERE id = ?",
+                    (str(msg_id), decision_id),
+                )
+                await self.store.db.commit()
+
+        logger.info(f"Decision requested for task {task.id}: {question}")
+
+    # --- Telegram Notifications (Gap 5) ---
+
+    async def _notify_success(self, task: Task, run: WorkRun) -> None:
+        """Notify via Telegram that a task succeeded."""
+        if self._telegram:
+            await self._telegram.notify_task_completed(
+                task_id=task.id,
+                title=task.title,
+                model=run.model_used,
+                duration=run.duration_seconds,
+                passed_qa=True,
+            )
+
+    async def _notify_failure(self, task: Task, run: WorkRun) -> None:
+        """Notify via Telegram that a task has permanently failed (retries exhausted)."""
+        if self._telegram:
+            await self._telegram.notify_task_failed(
+                task_id=task.id,
+                title=task.title,
+                error=run.error_message or "Unknown error",
+            )
+
+    async def _notify_budget_warning(self, spent: float, limit: float) -> None:
+        """Send a budget warning via Telegram (once per budget exhaustion)."""
+        if self._telegram and not self._budget_warning_sent:
+            await self._telegram.notify_budget_warning(spent, limit)
+            self._budget_warning_sent = True

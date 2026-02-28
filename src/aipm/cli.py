@@ -244,46 +244,27 @@ def status(ctx: click.Context) -> None:
 @click.option("--port", default=None, type=int, help="Dashboard port")
 @click.pass_context
 def run(ctx: click.Context, host: str | None, port: int | None) -> None:
-    """Start the AIPM daemon — scheduler + web dashboard."""
+    """Start the AIPM daemon — scheduler + Telegram bot + web dashboard."""
 
     async def _run():
         settings = load_settings(ctx.obj["config_path"])
-        from .db.store import Store
+        from .daemon import AIPMDaemon
 
-        store = Store(settings.db_path)
-        await store.connect()
-
-        # Import here to avoid circular imports
-        from .core.scheduler import Scheduler
-        from .web.app import create_app
-
-        scheduler = Scheduler(settings, store)
-        app = create_app(settings, store)
+        daemon = AIPMDaemon(
+            settings,
+            dashboard_host=host,
+            dashboard_port=port,
+        )
 
         dashboard_host = host or settings.dashboard.host
         dashboard_port = port or settings.dashboard.port
 
-        click.echo(f"Starting AIPM daemon...")
+        click.echo("Starting AIPM daemon...")
         click.echo(f"Dashboard: http://{dashboard_host}:{dashboard_port}")
         click.echo(f"Configured projects: {len(settings.github.projects)}")
+        click.echo(f"Telegram: {'enabled' if daemon.telegram.enabled else 'disabled'}")
         click.echo("Press Ctrl+C to stop.\n")
 
-        import uvicorn
-
-        config = uvicorn.Config(
-            app, host=dashboard_host, port=dashboard_port, log_level="info"
-        )
-        server = uvicorn.Server(config)
-
-        # Run scheduler and web server concurrently
-        try:
-            await asyncio.gather(
-                scheduler.start(),
-                server.serve(),
-            )
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            click.echo("\nShutting down...")
-            await scheduler.stop()
-            await store.close()
+        await daemon.start()
 
     asyncio.run(_run())

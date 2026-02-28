@@ -320,6 +320,35 @@ class Store:
             rows = await cursor.fetchall()
         return [self._row_to_decision(r) for r in rows]
 
+    async def get_pending_decision_for_task(self, task_id: str) -> Optional[Decision]:
+        """Find the pending decision associated with a task."""
+        async with self.db.execute(
+            "SELECT * FROM decisions WHERE task_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_decision(row) if row else None
+
+    # --- Work Run Queries for Retry Logic ---
+
+    async def count_failed_runs(self, task_id: str) -> int:
+        """Count the number of failed work runs for a task."""
+        async with self.db.execute(
+            "SELECT COUNT(*) as cnt FROM work_runs WHERE task_id = ? AND status = 'failed'",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row["cnt"] if row else 0
+
+    async def get_latest_failed_run(self, task_id: str) -> Optional[WorkRun]:
+        """Get the most recent failed run for a task."""
+        async with self.db.execute(
+            "SELECT * FROM work_runs WHERE task_id = ? AND status = 'failed' ORDER BY started_at DESC LIMIT 1",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_run(row) if row else None
+
     # --- Credit Usage ---
 
     async def record_credit(
