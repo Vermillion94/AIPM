@@ -1,0 +1,12 @@
+# Caddyfile — reverse proxy for AIPM dashboard
+# Replace YOUR_DOMAIN with your actual domain (or use :80 for IP-only access)
+#
+# Option A: With a domain (auto-HTTPS)
+# aipm.yourdomain.com {
+#     reverse_proxy localhost:8000
+# }
+#
+# Option B: IP-only access (no HTTPS, good for testing)
+:80 {
+    reverse_proxy localhost:8000
+}

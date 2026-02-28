@@ -1,0 +1,37 @@
+[Unit]
+Description=AIPM — AI Project Manager Daemon
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aipm
+Group=aipm
+WorkingDirectory=/opt/aipm
+
+# Load secrets from .env file
+EnvironmentFile=/opt/aipm/.env
+
+# Use the venv python
+ExecStart=/opt/aipm/.venv/bin/python -m aipm -c /opt/aipm/config.toml run
+
+# Auto-restart on crash (wait 10s between restarts)
+Restart=on-failure
+RestartSec=10
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=150%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aipm
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/aipm /tmp
+
+[Install]
+WantedBy=multi-user.target
