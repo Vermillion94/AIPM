@@ -18,6 +18,9 @@ data/
 
 # Environment / secrets
 .env
+.env.*
+*.env
+deploy/.env*
 config.toml
 
 # IDE
