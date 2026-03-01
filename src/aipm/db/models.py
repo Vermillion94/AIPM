@@ -168,12 +168,33 @@ class Decision(BaseModel):
     answered_at: Optional[datetime] = None
 
 
+class PipelineStepName(str, Enum):
+    CLASSIFY = "classify"
+    EXECUTE = "execute"
+    TEST = "test"
+    VERIFY_ENV = "verify_env"
+    CODE_REVIEW = "code_review"
+    CREATE_PR = "create_pr"
+    REQUEST_MERGE = "request_merge"
+    DOCUMENT = "document"
+
+
+class PipelineStepStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED_WITH_REASON = "skipped_with_reason"
+
+
 class LearningCategory(str, Enum):
     ERROR_PATTERN = "error_pattern"
     QA_FEEDBACK = "qa_feedback"
     ENV_GOTCHA = "env_gotcha"
     CONVENTION = "convention"
     POSITIVE_PATTERN = "positive_pattern"
+    MODEL_FEEDBACK = "model_feedback"
+    DEV_ENV_GAP = "dev_env_gap"
 
 
 class ProjectLearning(BaseModel):
@@ -193,4 +214,26 @@ class ProjectLearning(BaseModel):
             "content": self.content,
             "source_run_id": self.source_run_id,
             "relevance_count": self.relevance_count,
+        }
+
+
+class PipelineStep(BaseModel):
+    id: str
+    run_id: str
+    step_name: PipelineStepName
+    status: PipelineStepStatus = PipelineStepStatus.PENDING
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    output_summary: Optional[str] = None
+    skip_reason: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    def to_row(self) -> dict:
+        return {
+            "id": self.id,
+            "run_id": self.run_id,
+            "step_name": self.step_name.value,
+            "status": self.status.value,
+            "output_summary": self.output_summary,
+            "skip_reason": self.skip_reason,
         }

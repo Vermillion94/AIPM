@@ -13,8 +13,10 @@ import aiosqlite
 from .models import (
     Complexity,
     Decision,
-    DecisionStatus,
     LearningCategory,
+    PipelineStep,
+    PipelineStepName,
+    PipelineStepStatus,
     Project,
     ProjectLearning,
     RunStatus,
@@ -503,6 +505,124 @@ class Store:
         )
         await self.db.commit()
 
+    # --- Pipeline Steps ---
+
+    async def create_pipeline_steps(self, run_id: str) -> list[PipelineStep]:
+        """Bulk-create all 8 pipeline steps as PENDING for a run."""
+        steps = []
+        for step_name in PipelineStepName:
+            step = PipelineStep(
+                id=_new_id(),
+                run_id=run_id,
+                step_name=step_name,
+            )
+            await self.db.execute(
+                """INSERT INTO pipeline_steps (id, run_id, step_name, status, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (step.id, run_id, step_name.value, PipelineStepStatus.PENDING.value, _now()),
+            )
+            steps.append(step)
+        await self.db.commit()
+        return steps
+
+    async def update_pipeline_step(
+        self,
+        step_id: str,
+        status: PipelineStepStatus,
+        output_summary: Optional[str] = None,
+        skip_reason: Optional[str] = None,
+    ) -> None:
+        """Update a pipeline step status and timestamps."""
+        updates = ["status = ?"]
+        params: list = [status.value]
+
+        if status == PipelineStepStatus.RUNNING:
+            updates.append("started_at = ?")
+            params.append(_now())
+        if status in (
+            PipelineStepStatus.PASSED,
+            PipelineStepStatus.FAILED,
+            PipelineStepStatus.SKIPPED_WITH_REASON,
+        ):
+            updates.append("finished_at = ?")
+            params.append(_now())
+        if output_summary is not None:
+            updates.append("output_summary = ?")
+            params.append(output_summary)
+        if skip_reason is not None:
+            updates.append("skip_reason = ?")
+            params.append(skip_reason)
+
+        params.append(step_id)
+        await self.db.execute(
+            f"UPDATE pipeline_steps SET {', '.join(updates)} WHERE id = ?", params
+        )
+        await self.db.commit()
+
+    async def get_pipeline_steps(self, run_id: str) -> list[PipelineStep]:
+        """Fetch all pipeline steps for a run, ordered by creation."""
+        async with self.db.execute(
+            "SELECT * FROM pipeline_steps WHERE run_id = ? ORDER BY created_at ASC",
+            (run_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_pipeline_step(r) for r in rows]
+
+    # --- Model Performance ---
+
+    async def record_model_performance(
+        self,
+        project_id: str,
+        task_type: str,
+        model_used: str,
+        complexity: str,
+        qa_score: Optional[int],
+        tests_passed: int,
+        succeeded: int,
+        duration_seconds: Optional[int],
+        run_id: Optional[str] = None,
+    ) -> str:
+        """Insert a model performance record."""
+        perf_id = _new_id()
+        await self.db.execute(
+            """INSERT INTO model_performance
+               (id, project_id, task_type, model_used, complexity,
+                qa_score, tests_passed, succeeded, duration_seconds, run_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                perf_id, project_id, task_type, model_used, complexity,
+                qa_score, tests_passed, succeeded, duration_seconds, run_id, _now(),
+            ),
+        )
+        await self.db.commit()
+        return perf_id
+
+    async def get_model_success_rate(
+        self,
+        task_type: str,
+        model: str,
+        min_runs: int = 3,
+    ) -> Optional[dict]:
+        """Aggregate success rate for a model on a task type. Returns None if < min_runs."""
+        async with self.db.execute(
+            """SELECT COUNT(*) as total,
+                      COALESCE(SUM(succeeded), 0) as successes,
+                      COALESCE(AVG(qa_score), 0) as avg_score
+               FROM model_performance
+               WHERE task_type = ? AND model_used = ?""",
+            (task_type, model),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row or row["total"] < min_runs:
+            return None
+        total = row["total"]
+        return {
+            "total": total,
+            "successes": row["successes"],
+            "success_rate": row["successes"] / total if total > 0 else 0.0,
+            "avg_score": row["avg_score"],
+        }
+
     # --- Row converters ---
 
     @staticmethod
@@ -533,3 +653,7 @@ class Store:
     @staticmethod
     def _row_to_learning(row: aiosqlite.Row) -> ProjectLearning:
         return ProjectLearning(**dict(row))
+
+    @staticmethod
+    def _row_to_pipeline_step(row: aiosqlite.Row) -> PipelineStep:
+        return PipelineStep(**dict(row))

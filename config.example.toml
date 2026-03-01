@@ -17,14 +17,28 @@ per_task_budget_usd = 3.0
 repo = "owner/repo-name"
 labels = ["bug", "enhancement", "ai-ready"]
 priority = 10
-test_command = "npm test"
-build_command = "npm run build"
+
+[github.projects.deploy]
+platform = "render"
+service_id = "srv-abc123"
+app_url = "https://myapp.onrender.com"
+auto_deploys = true
+
+[github.projects.dev_env]
+start_command = "uvicorn main:app --host 127.0.0.1 --port {port}"
+seed_paths = ["/", "/dashboard", "/api/health"]
+setup_commands = []
+cookie_name = "session"
+framework = "fastapi"
+
+[github.projects.dev_env.env_vars]
+AUTH_CLIENT_ID = "qa_dummy"
+AUTH_CLIENT_SECRET = "qa_dummy"
 
 [[github.projects]]
 repo = "owner/another-repo"
 labels = []
 priority = 5
-test_command = "pytest"
 
 [anthropic]
 # API key loaded from ANTHROPIC_API_KEY env var

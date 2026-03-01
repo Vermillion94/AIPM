@@ -229,6 +229,50 @@ class TelegramNotifier:
         )
         return await self.send_message(text)
 
+    async def notify_step_skipped(
+        self, task_id: str, title: str, step_name: str, reason: str,
+    ) -> Optional[int]:
+        """Alert when any pipeline step is skipped."""
+        text = (
+            f"<b>Pipeline Step Skipped</b>\n\n"
+            f"<b>{title}</b>\n"
+            f"Task: <code>{task_id}</code>\n"
+            f"Step: <b>{step_name.upper()}</b>\n"
+            f"Reason: {reason[:300]}"
+        )
+        return await self.send_message(text)
+
+    async def notify_pipeline_summary(
+        self, task_id: str, title: str, steps: list,
+    ) -> Optional[int]:
+        """End-of-run summary showing status of all 8 pipeline steps."""
+        status_icons = {
+            "passed": "OK",
+            "failed": "FAIL",
+            "skipped_with_reason": "SKIP",
+            "running": "...",
+            "pending": "--",
+        }
+        lines = []
+        for step in steps:
+            status_val = step.status.value if hasattr(step.status, "value") else str(step.status)
+            icon = status_icons.get(status_val, "?")
+            step_name = step.step_name.value if hasattr(step.step_name, "value") else str(step.step_name)
+            line = f"  [{icon}] {step_name}"
+            if status_val == "skipped_with_reason" and step.skip_reason:
+                line += f" — {step.skip_reason[:60]}"
+            elif status_val == "failed" and step.output_summary:
+                line += f" — {step.output_summary[:60]}"
+            lines.append(line)
+
+        text = (
+            f"<b>Pipeline Summary</b>\n\n"
+            f"<b>{title}</b>\n"
+            f"Task: <code>{task_id}</code>\n\n"
+            f"<pre>{'&#10;'.join(lines)}</pre>"
+        )
+        return await self.send_message(text)
+
     async def start_polling(self) -> None:
         """Start listening for Telegram callback queries (for approvals).
 

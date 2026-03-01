@@ -14,6 +14,16 @@ from pydantic import BaseModel, Field
 # --- Pydantic config models ---
 
 
+class DevEnvConfig(BaseModel):
+    start_command: Optional[str] = None       # "python -m uvicorn main:app --host 127.0.0.1 --port {port}"
+    seed_paths: list[str] = Field(default_factory=list)  # ["/", "/dashboard", "/api/health"]
+    setup_commands: list[str] = Field(default_factory=list)  # Commands to run before starting server
+    env_vars: dict[str, str] = Field(default_factory=dict)  # Environment for dev server
+    cookie_name: Optional[str] = None         # Auth cookie name for crawling
+    db_seed_sql: Optional[str] = None         # SQL to seed test data
+    framework: Optional[str] = None           # "fastapi", "express", "nextjs"
+
+
 class DeployConfig(BaseModel):
     platform: Optional[str] = None       # "render", "fly", "vercel", "self-hosted", etc.
     service_id: Optional[str] = None     # e.g. "srv-d20p2f15pdvs7399d0o0"
@@ -30,6 +40,7 @@ class ProjectConfig(BaseModel):
     default_branch: str = "main"
     auto_pickup: bool = True
     deploy: DeployConfig = Field(default_factory=DeployConfig)
+    dev_env: DevEnvConfig = Field(default_factory=DevEnvConfig)
 
     @property
     def owner(self) -> str:

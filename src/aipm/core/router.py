@@ -45,7 +45,8 @@ class TaskRouter:
     async def classify_and_route(self, task: Task) -> tuple[Complexity, str]:
         """Classify a task and return (complexity, model_name).
 
-        Uses Haiku for fast, cheap classification.
+        Uses Haiku for fast, cheap classification, then adjusts based on
+        historical model performance.
         """
         try:
             prompt = build_triage_prompt(
@@ -69,6 +70,9 @@ class TaskRouter:
                 complexity, "sonnet"
             )
 
+            # Adjust model based on historical performance
+            model = await self._adjust_model_from_history(task, model)
+
             confidence = result.get("confidence", 0.5)
             logger.info(
                 f"Classified {task.id}: complexity={complexity.value}, "
@@ -88,6 +92,41 @@ class TaskRouter:
         except Exception as e:
             logger.error(f"Classification failed for {task.id}, defaulting to medium/sonnet: {e}")
             return Complexity.MEDIUM, "sonnet"
+
+    async def _adjust_model_from_history(self, task: Task, model: str) -> str:
+        """Check historical performance and escalate model if it fails too often."""
+        task_type = self._infer_task_type(task)
+        stats = await self.store.get_model_success_rate(task_type, model)
+
+        if stats and stats["total"] >= 3 and stats["success_rate"] < 0.5:
+            escalation = {"haiku": "sonnet", "sonnet": "opus"}
+            new_model = escalation.get(model)
+            if new_model:
+                logger.info(
+                    f"Escalating model for {task.id}: {model} → {new_model} "
+                    f"(success_rate={stats['success_rate']:.0%} on {task_type})"
+                )
+                return new_model
+
+        return model
+
+    @staticmethod
+    def _infer_task_type(task: Task) -> str:
+        """Infer a task type from labels and title."""
+        labels_lower = [lbl.lower() for lbl in (task.labels or [])]
+        title_lower = task.title.lower()
+
+        if "bug" in labels_lower or "fix" in title_lower:
+            return "bug_fix"
+        if "enhancement" in labels_lower or "feature" in labels_lower:
+            return "feature"
+        if "refactor" in labels_lower or "refactor" in title_lower:
+            return "refactor"
+        if "docs" in labels_lower or "documentation" in labels_lower:
+            return "docs"
+        if "test" in labels_lower or "test" in title_lower:
+            return "test"
+        return "general"
 
     def get_model_id(self, model_name: str) -> str:
         """Get the full model ID from a short name."""

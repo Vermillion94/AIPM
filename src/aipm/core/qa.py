@@ -21,7 +21,7 @@ import httpx
 if TYPE_CHECKING:
     from ..db.models import Project
 
-from ..config import Settings
+from ..config import DevEnvConfig, Settings
 from ..db.models import WorkRun
 from ..db.store import Store
 from ..prompts.review import build_code_review_prompt, classify_change_type
@@ -54,6 +54,7 @@ class QARunner:
         run: WorkRun,
         test_command: Optional[str] = None,
         project: Optional[Project] = None,
+        dev_env: Optional[DevEnvConfig] = None,
     ) -> QAResult:
         """Run all QA checks on a worktree. Returns overall QA result."""
         result = QAResult(passed=True)
@@ -234,14 +235,62 @@ class QARunner:
             logger.error(f"Code review failed for run {run.id}: {e}")
             return None
 
+    def _resolve_dev_env(self, project: Optional[Project]) -> Optional[DevEnvConfig]:
+        """Resolve DevEnvConfig from project config settings."""
+        if not project:
+            return None
+        # Look up the project's config from settings
+        for pc in self.settings.github.projects:
+            if pc.repo == f"{project.owner}/{project.repo}":
+                if pc.dev_env and pc.dev_env.start_command:
+                    return pc.dev_env
+        return None
+
+    def assess_dev_env_capability(
+        self, project: Optional[Project], worktree_path: Optional[Path] = None,
+        dev_env: Optional[DevEnvConfig] = None,
+    ) -> dict:
+        """Assess what verification is available for this project.
+
+        Returns dict with 'method' (local_server|live_site|none) and 'details'.
+        """
+        if dev_env and dev_env.start_command:
+            return {"method": "local_server", "details": f"start_command: {dev_env.start_command}"}
+        # Legacy: check for requirements.txt (BLWebsite-style)
+        if worktree_path and (worktree_path / "requirements.txt").exists():
+            return {"method": "local_server", "details": "Detected requirements.txt (legacy)"}
+        if project and getattr(project, "deploy_app_url", None):
+            return {"method": "live_site", "details": f"url: {project.deploy_app_url}"}
+        return {"method": "none", "details": "No dev env config or deploy URL available"}
+
     async def _get_visual_context(
         self, project: Optional[Project], worktree_path: Optional[Path] = None,
+        dev_env: Optional[DevEnvConfig] = None,
     ) -> dict:
         """Get visual context. Try local dev server first, fall back to live site."""
         if not project:
             return {}
 
-        # Try local server for authenticated page access
+        # Resolve dev_env from config if not provided
+        if not dev_env:
+            dev_env = self._resolve_dev_env(project)
+
+        # Try config-driven local server
+        if worktree_path and dev_env and dev_env.start_command:
+            try:
+                pages = await self._crawl_local_server(worktree_path, dev_env=dev_env)
+                if pages:
+                    content_parts = []
+                    for page in pages:
+                        content_parts.append(f"[{page['url']}]\n{page['content'][:2000]}")
+                    logger.info(
+                        f"Local server crawl succeeded for {project.id}: {len(pages)} pages"
+                    )
+                    return {"live_content": "\n\n---\n\n".join(content_parts)}
+            except Exception as e:
+                logger.info(f"Config-driven local server crawl failed: {e}")
+
+        # Legacy: try local server for authenticated page access (BLWebsite-style)
         if worktree_path and (worktree_path / "requirements.txt").exists():
             try:
                 pages = await self._crawl_local_server(worktree_path)
@@ -286,23 +335,54 @@ class QARunner:
         "/resources/howto",
     )
 
-    async def _crawl_local_server(self, worktree_path: Path) -> list[dict]:
+    async def _crawl_local_server(
+        self, worktree_path: Path, dev_env: Optional[DevEnvConfig] = None,
+    ) -> list[dict]:
         """Orchestrate: venv → start server → seed DB → forge cookie → crawl → cleanup."""
         import secrets as secrets_mod
 
         secret = secrets_mod.token_hex(32)
         port = self._find_free_port()
         venv_path = self._get_qa_venv_path(worktree_path)
-        db_path = worktree_path / "DevData" / "lol_rec_league.db"
         proc = None
 
+        # Config-driven paths, with legacy BLWebsite defaults
+        cookie_name = (dev_env.cookie_name if dev_env else None) or "bl_session"
+        seed_paths = (dev_env.seed_paths if dev_env and dev_env.seed_paths else None) or list(
+            self._SEED_PATHS
+        )
+        db_seed_sql = dev_env.db_seed_sql if dev_env else None
+        db_path = worktree_path / "DevData" / "lol_rec_league.db"
+
         try:
+            # Run setup commands if configured
+            if dev_env and dev_env.setup_commands:
+                for cmd in dev_env.setup_commands:
+                    result = await self._run_command(cmd, worktree_path, timeout=120)
+                    if result["returncode"] != 0:
+                        logger.warning(f"Setup command failed: {cmd}: {result['output'][:200]}")
+
             await self._ensure_qa_venv(worktree_path, venv_path)
-            proc = await self._start_local_server(worktree_path, venv_path, port, secret)
+
+            if dev_env and dev_env.start_command:
+                proc = await self._start_local_server_from_config(
+                    worktree_path, venv_path, port, secret, dev_env,
+                )
+            else:
+                proc = await self._start_local_server(worktree_path, venv_path, port, secret)
+
             await self._wait_for_server(port, timeout=45)
-            self._seed_test_user(db_path)
+
+            if db_seed_sql:
+                self._run_seed_sql(db_path, db_seed_sql)
+            else:
+                self._seed_test_user(db_path)
+
             cookie = self._forge_session_cookie(secret)
-            pages = await self._crawl_with_auth(port, cookie, max_pages=8)
+            pages = await self._crawl_with_auth(
+                port, cookie, cookie_name=cookie_name,
+                seed_paths=seed_paths, max_pages=8,
+            )
             return pages
         finally:
             # Always kill server and clean up throwaway DB
@@ -395,6 +475,47 @@ class QARunner:
         logger.info(f"Started local QA server on 127.0.0.1:{port} (pid={proc.pid})")
         return proc
 
+    async def _start_local_server_from_config(
+        self,
+        worktree_path: Path,
+        venv_path: Path,
+        port: int,
+        secret: str,
+        dev_env: DevEnvConfig,
+    ) -> asyncio.subprocess.Process:
+        """Start a local server using DevEnvConfig. Returns the process."""
+        python = str(venv_path / "bin" / "python")
+        cmd_str = dev_env.start_command.format(port=port)
+
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "SESSION_SECRET": secret,
+            **dev_env.env_vars,
+        }
+
+        proc = await asyncio.create_subprocess_shell(
+            f"{python} -m {cmd_str}" if not cmd_str.startswith("/") else cmd_str,
+            cwd=str(worktree_path),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        logger.info(f"Started config-driven QA server on 127.0.0.1:{port} (pid={proc.pid})")
+        return proc
+
+    @staticmethod
+    def _run_seed_sql(db_path: Path, sql: str) -> None:
+        """Run custom seed SQL against the local SQLite DB."""
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executescript(sql)
+            conn.commit()
+            logger.debug(f"Ran seed SQL against {db_path}")
+        finally:
+            conn.close()
+
     async def _wait_for_server(self, port: int, timeout: int = 45) -> None:
         """Poll http://127.0.0.1:{port}/ until it responds or timeout."""
         url = f"http://127.0.0.1:{port}/"
@@ -439,20 +560,21 @@ class QARunner:
         return signer.sign(data).decode()
 
     async def _crawl_with_auth(
-        self, port: int, cookie: str, max_pages: int = 8,
+        self, port: int, cookie: str, cookie_name: str = "bl_session",
+        seed_paths: Optional[list[str]] = None, max_pages: int = 8,
     ) -> list[dict]:
         """Crawl localhost with the forged session cookie."""
         base_url = f"http://127.0.0.1:{port}"
         pages: list[dict] = []
         visited: set[str] = set()
 
-        # Start with seed URLs
-        to_visit = [f"{base_url}{path}" for path in self._SEED_PATHS]
+        paths = seed_paths or list(self._SEED_PATHS)
+        to_visit = [f"{base_url}{path}" for path in paths]
 
         async with httpx.AsyncClient(
             timeout=10.0,
             follow_redirects=True,
-            cookies={"bl_session": cookie},
+            cookies={cookie_name: cookie},
             headers={"User-Agent": "AIPM-QA/1.0"},
         ) as client:
             while to_visit and len(pages) < max_pages:
@@ -529,6 +651,24 @@ class QARunner:
                         return "npm test"
             except Exception:
                 pass
+
+        # Go projects
+        if (worktree_path / "go.mod").exists():
+            return "go test ./..."
+
+        # Rust projects
+        if (worktree_path / "Cargo.toml").exists():
+            return "cargo test"
+
+        # Ruby projects
+        if (worktree_path / "Gemfile").exists():
+            if (worktree_path / "spec").is_dir():
+                return "bundle exec rspec"
+
+        # PHP projects
+        if (worktree_path / "composer.json").exists():
+            if (worktree_path / "vendor" / "bin" / "phpunit").exists():
+                return "vendor/bin/phpunit"
 
         # Makefile
         if (worktree_path / "Makefile").exists():

@@ -42,8 +42,10 @@ Follow this guidance unless you identify a clearly better alternative.
 
 1. **Understand the issue**: Read the relevant source code to fully understand the context and requirements.
 2. **Implement the fix/feature**: Make the minimum necessary changes to resolve the issue correctly.
-3. **Write or update tests**: Ensure your changes are covered by tests where applicable.
-4. **Run existing tests**: Verify that all existing tests still pass.
+3. **Write or update tests**: You MUST write or update tests for your changes.
+   If no test framework exists, create a minimal test file.
+   The only exception is pure documentation changes with zero logic.
+4. **Run the test suite** and verify all tests pass. Fix any tests you break.
 5. **Commit your changes**: Create a single, well-described commit.
 
 ## Rules

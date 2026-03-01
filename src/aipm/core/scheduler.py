@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from ..config import Settings
@@ -13,13 +12,13 @@ from ..db.models import (
     Decision,
     DecisionStatus,
     LearningCategory,
-    RunStatus,
     TaskStatus,
 )
 from ..db.store import Store
 from ..github.actions import GitHubActions
 from ..github.sync import GitHubSync
 from .budget import BudgetTracker
+from .pipeline import PipelineRunner
 from .qa import QARunner
 from .router import TaskRouter
 from .worker import Worker
@@ -45,6 +44,14 @@ class Scheduler:
         self.qa = QARunner(settings, store)
         self.worktree_mgr = WorktreeManager(settings.worktrees_path)
         self.github_actions = GitHubActions(settings)
+        self.pipeline = PipelineRunner(
+            settings=settings,
+            store=store,
+            worker=self.worker,
+            qa=self.qa,
+            worktree_mgr=self.worktree_mgr,
+            github_actions=self.github_actions,
+        )
         self._running = False
 
         # Pause event: set = running, cleared = paused
@@ -58,6 +65,7 @@ class Scheduler:
     def set_telegram(self, telegram: TelegramNotifier) -> None:
         """Set the Telegram notifier for sending notifications."""
         self._telegram = telegram
+        self.pipeline.set_telegram(telegram)
 
     async def run_once(self) -> dict:
         """Run a single cycle: sync → pick task → execute → QA → publish.
@@ -141,45 +149,24 @@ class Scheduler:
             await self.store.update_task_status(task.id, TaskStatus.FAILED)
             return summary
 
-        # 7. Execute work
+        # 7. Run the pipeline
         execution_mode = self.budget.select_execution_mode(model)
-        run = await self.worker.execute(
+        pipeline_result = await self.pipeline.run(
             task=task,
+            project=project,
             worktree_path=worktree_path,
             model=model,
             execution_mode=execution_mode,
+            complexity_str=complexity.value,
+            branch_name=branch_name,
         )
-        summary["worked"] = {"task_id": task.id, "model": model, "run_id": run.id}
+        summary["worked"] = {
+            "task_id": task.id, "model": model, "run_id": pipeline_result.run.id,
+        }
+        summary["pipeline_passed"] = pipeline_result.passed
 
-        # 8. Run QA (if work succeeded)
-        if run.status == RunStatus.SUCCEEDED:
-            qa_result = await self.qa.run_checks(worktree_path, run, None, project=project)
-            summary["qa"] = {
-                "passed": qa_result.passed,
-                "issues": qa_result.issues,
-            }
-
-            # Extract learnings from QA review
-            await self._extract_learnings_from_qa(task, run, qa_result)
-
-            if qa_result.passed:
-                # Publish results: push branch → create PR → comment on issue
-                await self._publish_results(task, run, project, worktree_path, branch_name)
-                logger.info(f"Task {task.id} completed, passed QA, and published!")
-                # Increment relevance for injected learnings that contributed to success
-                if self.worker._last_injected_learning_ids:
-                    await self.store.increment_learning_relevance(
-                        self.worker._last_injected_learning_ids
-                    )
-                # Notify success
-                await self._notify_success(task, run)
-            else:
-                # Mark the run as failed so retry counting works
-                await self.store.update_run(run.id, status=RunStatus.FAILED)
-                await self._handle_failure(task, run)
-                logger.warning(f"Task {task.id} failed QA: {qa_result.issues}")
-        else:
-            await self._handle_failure(task, run)
+        if not pipeline_result.passed:
+            await self._handle_failure(task, pipeline_result.run)
 
         return summary
 
@@ -295,180 +282,24 @@ class Scheduler:
                 return
 
             execution_mode = self.budget.select_execution_mode(model)
-            run = await self.worker.execute(
+            pipeline_result = await self.pipeline.run(
                 task=task,
+                project=project,
                 worktree_path=worktree_path,
                 model=model,
                 execution_mode=execution_mode,
+                complexity_str=complexity.value,
+                branch_name=branch_name,
             )
 
-            if run.status == RunStatus.SUCCEEDED:
-                qa_result = await self.qa.run_checks(
-                    worktree_path, run, None, project=project
-                )
-                # Extract learnings from QA review
-                await self._extract_learnings_from_qa(task, run, qa_result)
-
-                if qa_result.passed:
-                    await self._publish_results(task, run, project, worktree_path, branch_name)
-                    # Increment relevance for injected learnings
-                    if self.worker._last_injected_learning_ids:
-                        await self.store.increment_learning_relevance(
-                            self.worker._last_injected_learning_ids
-                        )
-                    await self._notify_success(task, run)
-                else:
-                    # Mark the run as failed so retry counting works
-                    await self.store.update_run(run.id, status=RunStatus.FAILED)
-                    await self._handle_failure(task, run)
-            else:
-                await self._handle_failure(task, run)
+            if not pipeline_result.passed:
+                await self._handle_failure(task, pipeline_result.run)
 
         except Exception as e:
             logger.exception(f"Background work failed for {task.id}: {e}")
             await self.store.update_task_status(task.id, TaskStatus.FAILED)
 
-    # --- Learnings Extraction ---
-
-    async def _extract_learnings_from_qa(
-        self, task: Task, run: WorkRun, qa_result
-    ) -> None:
-        """Extract learnings from QA review_raw and record them."""
-        review = qa_result.review_raw
-        if not review:
-            return
-        for issue in review.get("issues", []):
-            desc = issue.get("description", "") if isinstance(issue, dict) else str(issue)
-            if desc:
-                await self.store.record_learning(
-                    task.project_id,
-                    LearningCategory.QA_FEEDBACK,
-                    desc,
-                    source_run_id=run.id,
-                )
-        for praise in review.get("praise", []):
-            if praise:
-                await self.store.record_learning(
-                    task.project_id,
-                    LearningCategory.POSITIVE_PATTERN,
-                    str(praise),
-                    source_run_id=run.id,
-                )
-
-    # --- PR Creation (Gap 3) ---
-
-    async def _publish_results(
-        self,
-        task: Task,
-        run: WorkRun,
-        project,
-        worktree_path: Path,
-        branch_name: str,
-    ) -> None:
-        """After QA passes: push branch → create PR → comment on issue → update run."""
-        try:
-            # Push branch
-            pushed = await self.github_actions.push_branch(
-                str(worktree_path), branch_name
-            )
-            if not pushed:
-                logger.error(f"Failed to push branch {branch_name} for task {task.id}")
-                await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
-                return
-
-            # Create PR
-            pr_title = f"[AIPM] Fix #{task.github_number}: {task.title}"
-            pr_body = (
-                f"Automated fix for #{task.github_number}\n\n"
-                f"**Issue:** {task.title}\n"
-                f"**Model:** {run.model_used}\n"
-                f"**Duration:** {run.duration_seconds}s\n\n"
-                f"---\n"
-                f"*Generated by AIPM*"
-            )
-
-            pr_data = await self.github_actions.create_pull_request(
-                owner=project.owner,
-                repo=project.repo,
-                title=pr_title,
-                body=pr_body,
-                head_branch=branch_name,
-                base_branch=project.default_branch,
-            )
-
-            if pr_data:
-                pr_url = pr_data.get("html_url", "")
-                pr_number = pr_data.get("number", 0)
-
-                # Update run with PR info
-                await self.store.update_run(
-                    run.id, pr_url=pr_url, pr_number=pr_number
-                )
-                # Store on run object for downstream use
-                run.pr_number = pr_number
-                run.pr_url = pr_url
-
-                # Comment on the original issue
-                await self.github_actions.comment_on_issue(
-                    owner=project.owner,
-                    repo=project.repo,
-                    issue_number=task.github_number,
-                    body=f"AIPM has created a pull request to address this issue: #{pr_number}\n\n"
-                         f"Model used: {run.model_used}",
-                )
-
-                logger.info(f"Published PR #{pr_number} for task {task.id}")
-
-                # Check Render preview if applicable
-                preview = await self._check_render_preview(project, branch_name)
-                if preview:
-                    preview_status = preview.get("status", "unknown")
-                    preview_note = f"\n**Preview:** {preview_status}"
-                    if preview.get("url"):
-                        preview_note += f" — {preview['url']}"
-                    await self.github_actions.comment_on_issue(
-                        owner=project.owner,
-                        repo=project.repo,
-                        issue_number=task.github_number,
-                        body=f"Render preview deploy: {preview_status}{' — ' + preview['url'] if preview.get('url') else ''}",
-                    )
-
-            # Task stays IN_REVIEW until user merges/rejects via Telegram
-            await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
-
-        except Exception as e:
-            logger.error(f"Failed to publish results for {task.id}: {e}")
-            # Still mark as IN_REVIEW so it's not lost
-            await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
-
-    # --- Render Preview Check (Feature 3) ---
-
-    async def _check_render_preview(
-        self, project, branch_name: str
-    ) -> Optional[dict]:
-        """Check Render PR preview status if the project uses Render with a service_id."""
-        if (
-            not getattr(project, "deploy_platform", None) == "render"
-            or not getattr(project, "deploy_service_id", None)
-        ):
-            return None
-
-        try:
-            from ..integrations.render_client import RenderClient
-
-            client = RenderClient(project.deploy_service_id)
-            result = await client.check_preview_health(branch_name, timeout=120)
-            await client.close()
-            logger.info(
-                f"Render preview for {branch_name}: "
-                f"found={result.get('found')}, status={result.get('status')}"
-            )
-            return result if result.get("found") else None
-        except Exception as e:
-            logger.warning(f"Render preview check failed: {e}")
-            return None
-
-    # --- Retry Logic (Gap 4) ---
+    # --- Retry Logic ---
 
     def _should_retry(self, failed_count: int) -> bool:
         """Check if a task should be retried based on failure count."""
@@ -563,32 +394,7 @@ class Scheduler:
 
         logger.info(f"Decision requested for task {task.id}: {question}")
 
-    # --- Telegram Notifications (Gap 5) ---
-
-    async def _notify_success(self, task: Task, run: WorkRun) -> None:
-        """Notify via Telegram that a task succeeded."""
-        if self._telegram:
-            if run.pr_number:
-                # Send PR notification with merge/reject buttons
-                project = await self.store.get_project(task.project_id)
-                if project:
-                    await self._telegram.notify_pr_ready(
-                        task_id=task.id,
-                        title=task.title,
-                        pr_number=run.pr_number,
-                        pr_url=run.pr_url or "",
-                        owner=project.owner,
-                        repo=project.repo,
-                    )
-                    return
-            # Fallback: no PR created
-            await self._telegram.notify_task_completed(
-                task_id=task.id,
-                title=task.title,
-                model=run.model_used,
-                duration=run.duration_seconds,
-                passed_qa=True,
-            )
+    # --- Telegram Notifications ---
 
     async def _notify_failure(self, task: Task, run: WorkRun) -> None:
         """Notify via Telegram that a task has permanently failed (retries exhausted)."""

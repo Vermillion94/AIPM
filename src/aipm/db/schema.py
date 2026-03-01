@@ -106,4 +106,33 @@ CREATE TABLE IF NOT EXISTS project_learnings (
 
 CREATE INDEX IF NOT EXISTS idx_learnings_project ON project_learnings(project_id);
 CREATE INDEX IF NOT EXISTS idx_learnings_category ON project_learnings(category);
+
+CREATE TABLE IF NOT EXISTS pipeline_steps (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES work_runs(id),
+    step_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    started_at TEXT,
+    finished_at TEXT,
+    output_summary TEXT,
+    skip_reason TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_steps_run ON pipeline_steps(run_id);
+
+CREATE TABLE IF NOT EXISTS model_performance (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    task_type TEXT NOT NULL,
+    model_used TEXT NOT NULL,
+    complexity TEXT NOT NULL,
+    qa_score INTEGER,
+    tests_passed INTEGER DEFAULT 0,
+    succeeded INTEGER DEFAULT 0,
+    duration_seconds INTEGER,
+    run_id TEXT REFERENCES work_runs(id),
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_model_perf_project ON model_performance(project_id);
+CREATE INDEX IF NOT EXISTS idx_model_perf_model ON model_performance(model_used, task_type);
 """
