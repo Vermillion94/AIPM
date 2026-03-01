@@ -14,7 +14,9 @@ from .models import (
     Complexity,
     Decision,
     DecisionStatus,
+    LearningCategory,
     Project,
+    ProjectLearning,
     RunStatus,
     Task,
     TaskStatus,
@@ -185,14 +187,34 @@ class Store:
         )
         await self.db.commit()
 
-    async def get_next_task(self) -> Optional[Task]:
-        """Get the highest-priority backlog task ready for work."""
+    async def get_active_project_ids(self) -> list[str]:
+        """Get project_ids that have a currently running work run."""
         async with self.db.execute(
-            """SELECT * FROM tasks
-               WHERE status = 'backlog' AND github_state = 'open'
-               ORDER BY priority_score DESC, created_at ASC
-               LIMIT 1"""
+            """SELECT DISTINCT t.project_id
+               FROM work_runs wr
+               JOIN tasks t ON wr.task_id = t.id
+               WHERE wr.status = 'running'"""
         ) as cursor:
+            rows = await cursor.fetchall()
+        return [r["project_id"] for r in rows]
+
+    async def get_next_task(
+        self, exclude_project_ids: Optional[list[str]] = None
+    ) -> Optional[Task]:
+        """Get the highest-priority backlog task ready for work.
+
+        Args:
+            exclude_project_ids: Skip tasks from these projects (used for
+                per-repo serialization).
+        """
+        query = "SELECT * FROM tasks WHERE status = 'backlog' AND github_state = 'open'"
+        params: list = []
+        if exclude_project_ids:
+            placeholders = ",".join("?" for _ in exclude_project_ids)
+            query += f" AND project_id NOT IN ({placeholders})"
+            params.extend(exclude_project_ids)
+        query += " ORDER BY priority_score DESC, created_at ASC LIMIT 1"
+        async with self.db.execute(query, params) as cursor:
             row = await cursor.fetchone()
         return self._row_to_task(row) if row else None
 
@@ -356,6 +378,25 @@ class Store:
             row = await cursor.fetchone()
         return self._row_to_run(row) if row else None
 
+    async def reset_failed_runs(self, task_id: str) -> int:
+        """Delete failed work runs for a task, resetting the retry counter.
+
+        Used when a human explicitly approves a retry after exhausting retries.
+        Returns the number of runs deleted.
+        """
+        async with self.db.execute(
+            "SELECT COUNT(*) as cnt FROM work_runs WHERE task_id = ? AND status = 'failed'",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        count = row["cnt"] if row else 0
+        await self.db.execute(
+            "DELETE FROM work_runs WHERE task_id = ? AND status = 'failed'",
+            (task_id,),
+        )
+        await self.db.commit()
+        return count
+
     # --- Credit Usage ---
 
     async def record_credit(
@@ -407,6 +448,61 @@ class Store:
             "daily_spend_usd": daily_spend,
         }
 
+    # --- Project Learnings ---
+
+    async def record_learning(
+        self,
+        project_id: str,
+        category: LearningCategory,
+        content: str,
+        source_run_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Insert a learning with dedup check. Returns ID or None if duplicate."""
+        async with self.db.execute(
+            "SELECT id FROM project_learnings WHERE project_id = ? AND category = ? AND content = ?",
+            (project_id, category.value, content),
+        ) as cursor:
+            if await cursor.fetchone():
+                return None
+        learning_id = _new_id()
+        await self.db.execute(
+            """INSERT INTO project_learnings (id, project_id, category, content, source_run_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (learning_id, project_id, category.value, content, source_run_id, _now()),
+        )
+        await self.db.commit()
+        return learning_id
+
+    async def get_learnings(
+        self,
+        project_id: str,
+        categories: Optional[list[LearningCategory]] = None,
+        limit: int = 20,
+    ) -> list[ProjectLearning]:
+        """Fetch learnings ordered by relevance_count DESC, created_at DESC."""
+        query = "SELECT * FROM project_learnings WHERE project_id = ?"
+        params: list = [project_id]
+        if categories:
+            placeholders = ",".join("?" for _ in categories)
+            query += f" AND category IN ({placeholders})"
+            params.extend(c.value for c in categories)
+        query += " ORDER BY relevance_count DESC, created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self.db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_learning(r) for r in rows]
+
+    async def increment_learning_relevance(self, learning_ids: list[str]) -> None:
+        """Bulk increment relevance_count for the given learning IDs."""
+        if not learning_ids:
+            return
+        placeholders = ",".join("?" for _ in learning_ids)
+        await self.db.execute(
+            f"UPDATE project_learnings SET relevance_count = relevance_count + 1 WHERE id IN ({placeholders})",
+            learning_ids,
+        )
+        await self.db.commit()
+
     # --- Row converters ---
 
     @staticmethod
@@ -433,3 +529,7 @@ class Store:
         d = dict(row)
         d["options"] = json.loads(d.get("options", "[]"))
         return Decision(**d)
+
+    @staticmethod
+    def _row_to_learning(row: aiosqlite.Row) -> ProjectLearning:
+        return ProjectLearning(**dict(row))

@@ -1,6 +1,12 @@
 """Prompt templates for worker coding tasks."""
 
 
+def _learnings_section(learnings: str) -> str:
+    if not learnings:
+        return ""
+    return f"## Project Notes\n{learnings}\n\n"
+
+
 def build_coding_prompt(
     issue_number: int,
     project_repo: str,
@@ -8,6 +14,7 @@ def build_coding_prompt(
     body: str,
     labels: list[str],
     approach: str = "",
+    learnings: str = "",
 ) -> str:
     """Build the main coding prompt for a worker agent."""
     labels_str = ", ".join(labels) if labels else "none"
@@ -31,8 +38,7 @@ Follow this guidance unless you identify a clearly better alternative.
 **Description:**
 {body}
 
-{approach_section}
-## Instructions
+{approach_section}{_learnings_section(learnings)}## Instructions
 
 1. **Understand the issue**: Read the relevant source code to fully understand the context and requirements.
 2. **Implement the fix/feature**: Make the minimum necessary changes to resolve the issue correctly.

@@ -166,3 +166,31 @@ class Decision(BaseModel):
     telegram_message_id: Optional[str] = None
     created_at: Optional[datetime] = None
     answered_at: Optional[datetime] = None
+
+
+class LearningCategory(str, Enum):
+    ERROR_PATTERN = "error_pattern"
+    QA_FEEDBACK = "qa_feedback"
+    ENV_GOTCHA = "env_gotcha"
+    CONVENTION = "convention"
+    POSITIVE_PATTERN = "positive_pattern"
+
+
+class ProjectLearning(BaseModel):
+    id: str
+    project_id: str
+    category: LearningCategory = LearningCategory.ERROR_PATTERN
+    content: str
+    source_run_id: Optional[str] = None
+    relevance_count: int = 0
+    created_at: Optional[datetime] = None
+
+    def to_row(self) -> dict:
+        return {
+            "id": self.id,
+            "project_id": self.project_id,
+            "category": self.category.value,
+            "content": self.content,
+            "source_run_id": self.source_run_id,
+            "relevance_count": self.relevance_count,
+        }

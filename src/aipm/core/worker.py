@@ -25,6 +25,7 @@ class Worker:
         self.settings = settings
         self.store = store
         self.budget = BudgetTracker(settings, store)
+        self._last_injected_learning_ids: list[str] = []
 
     async def execute(
         self,
@@ -50,6 +51,15 @@ class Worker:
         run_id = await self.store.create_run(run)
         run.id = run_id
 
+        # Fetch project learnings
+        learnings = await self.store.get_learnings(task.project_id, limit=15)
+        self._last_injected_learning_ids = [lr.id for lr in learnings]
+        learnings_text = ""
+        if learnings:
+            learnings_text = "\n".join(
+                f"- [{lr.category.value}] {lr.content}" for lr in learnings
+            )
+
         # Build the prompt
         prompt = build_coding_prompt(
             issue_number=task.github_number,
@@ -58,6 +68,7 @@ class Worker:
             body=task.body,
             labels=task.labels,
             approach=approach,
+            learnings=learnings_text,
         )
 
         # Check for previous failed runs and inject retry context
@@ -139,7 +150,7 @@ class Worker:
         cli_model = model_map.get(model, "sonnet")
 
         cmd = [
-            "claude",
+            "/usr/bin/claude",
             "--print",
             "--model", cli_model,
             "--output-format", "text",

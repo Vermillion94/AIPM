@@ -12,6 +12,7 @@ from ..db.models import (
     Complexity,
     Decision,
     DecisionStatus,
+    LearningCategory,
     RunStatus,
     TaskStatus,
 )
@@ -88,20 +89,28 @@ class Scheduler:
             summary["workers_busy"] = True
             return summary
 
-        # 4. Pick next task
-        task = await self.store.get_next_task()
+        # 4. Pick next task (exclude repos with active runs)
+        busy_projects = await self.store.get_active_project_ids()
+        task = await self.store.get_next_task(exclude_project_ids=busy_projects)
         if not task:
             logger.info("No tasks in backlog")
             summary["no_tasks"] = True
             return summary
 
-        # 5. Classify and route
+        # 5. Pre-dispatch retry check
+        failed_count = await self.store.count_failed_runs(task.id)
+        if not self._should_retry(failed_count) and failed_count > 0:
+            await self.store.update_task_status(task.id, TaskStatus.FAILED)
+            logger.warning(f"Task {task.id} retries exhausted ({failed_count} failures), skipping")
+            summary["retries_exhausted"] = True
+            return summary
+
+        # 6. Classify and route
         complexity, model = await self.router.classify_and_route(task)
         logger.info(f"Routing task {task.id} → {model} (complexity: {complexity.value})")
 
-        # 5b. Complex task gate: request human approval before first execution
+        # 6b. Complex task gate: request human approval before first execution
         if complexity == Complexity.COMPLEX:
-            failed_count = await self.store.count_failed_runs(task.id)
             if failed_count == 0:
                 # First attempt on a complex task — request approval
                 await self._request_decision(
@@ -144,19 +153,29 @@ class Scheduler:
 
         # 8. Run QA (if work succeeded)
         if run.status == RunStatus.SUCCEEDED:
-            qa_result = await self.qa.run_checks(worktree_path, run, None)
+            qa_result = await self.qa.run_checks(worktree_path, run, None, project=project)
             summary["qa"] = {
                 "passed": qa_result.passed,
                 "issues": qa_result.issues,
             }
 
+            # Extract learnings from QA review
+            await self._extract_learnings_from_qa(task, run, qa_result)
+
             if qa_result.passed:
                 # Publish results: push branch → create PR → comment on issue
                 await self._publish_results(task, run, project, worktree_path, branch_name)
                 logger.info(f"Task {task.id} completed, passed QA, and published!")
+                # Increment relevance for injected learnings that contributed to success
+                if self.worker._last_injected_learning_ids:
+                    await self.store.increment_learning_relevance(
+                        self.worker._last_injected_learning_ids
+                    )
                 # Notify success
                 await self._notify_success(task, run)
             else:
+                # Mark the run as failed so retry counting works
+                await self.store.update_run(run.id, status=RunStatus.FAILED)
                 await self._handle_failure(task, run)
                 logger.warning(f"Task {task.id} failed QA: {qa_result.issues}")
         else:
@@ -202,7 +221,10 @@ class Scheduler:
 
                     active_runs = await self.store.count_active_runs()
                     if active_runs < self.settings.aipm.max_concurrent_workers:
-                        task = await self.store.get_next_task()
+                        busy_projects = await self.store.get_active_project_ids()
+                        task = await self.store.get_next_task(
+                            exclude_project_ids=busy_projects
+                        )
                         if task:
                             # Run work in background
                             asyncio.create_task(self._work_on_task(task))
@@ -233,6 +255,16 @@ class Scheduler:
     async def _work_on_task(self, task: Task) -> None:
         """Background task to work on a single issue."""
         try:
+            # Pre-dispatch retry check — don't waste a run if retries exhausted
+            failed_count = await self.store.count_failed_runs(task.id)
+            if not self._should_retry(failed_count) and failed_count > 0:
+                await self.store.update_task_status(task.id, TaskStatus.FAILED)
+                logger.warning(
+                    f"Task {task.id} has {failed_count} failures, "
+                    f"skipping (retries exhausted)"
+                )
+                return
+
             complexity, model = await self.router.classify_and_route(task)
             project = await self.store.get_project(task.project_id)
             if not project:
@@ -272,12 +304,22 @@ class Scheduler:
 
             if run.status == RunStatus.SUCCEEDED:
                 qa_result = await self.qa.run_checks(
-                    worktree_path, run, None
+                    worktree_path, run, None, project=project
                 )
+                # Extract learnings from QA review
+                await self._extract_learnings_from_qa(task, run, qa_result)
+
                 if qa_result.passed:
                     await self._publish_results(task, run, project, worktree_path, branch_name)
+                    # Increment relevance for injected learnings
+                    if self.worker._last_injected_learning_ids:
+                        await self.store.increment_learning_relevance(
+                            self.worker._last_injected_learning_ids
+                        )
                     await self._notify_success(task, run)
                 else:
+                    # Mark the run as failed so retry counting works
+                    await self.store.update_run(run.id, status=RunStatus.FAILED)
                     await self._handle_failure(task, run)
             else:
                 await self._handle_failure(task, run)
@@ -285,6 +327,33 @@ class Scheduler:
         except Exception as e:
             logger.exception(f"Background work failed for {task.id}: {e}")
             await self.store.update_task_status(task.id, TaskStatus.FAILED)
+
+    # --- Learnings Extraction ---
+
+    async def _extract_learnings_from_qa(
+        self, task: Task, run: WorkRun, qa_result
+    ) -> None:
+        """Extract learnings from QA review_raw and record them."""
+        review = qa_result.review_raw
+        if not review:
+            return
+        for issue in review.get("issues", []):
+            desc = issue.get("description", "") if isinstance(issue, dict) else str(issue)
+            if desc:
+                await self.store.record_learning(
+                    task.project_id,
+                    LearningCategory.QA_FEEDBACK,
+                    desc,
+                    source_run_id=run.id,
+                )
+        for praise in review.get("praise", []):
+            if praise:
+                await self.store.record_learning(
+                    task.project_id,
+                    LearningCategory.POSITIVE_PATTERN,
+                    str(praise),
+                    source_run_id=run.id,
+                )
 
     # --- PR Creation (Gap 3) ---
 
@@ -408,6 +477,15 @@ class Scheduler:
 
     async def _handle_failure(self, task: Task, run: WorkRun) -> None:
         """Handle a failed task: retry or escalate."""
+        # Record error as a learning
+        if run.error_message:
+            await self.store.record_learning(
+                task.project_id,
+                LearningCategory.ERROR_PATTERN,
+                run.error_message[:500],
+                source_run_id=run.id,
+            )
+
         failed_count = await self.store.count_failed_runs(task.id)
 
         if self._should_retry(failed_count):

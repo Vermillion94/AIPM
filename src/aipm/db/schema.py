@@ -93,4 +93,17 @@ CREATE INDEX IF NOT EXISTS idx_work_runs_task_id ON work_runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_work_runs_status ON work_runs(status);
 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
 CREATE INDEX IF NOT EXISTS idx_credit_usage_created ON credit_usage(created_at);
+
+CREATE TABLE IF NOT EXISTS project_learnings (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    category TEXT NOT NULL DEFAULT 'error_pattern',
+    content TEXT NOT NULL,
+    source_run_id TEXT REFERENCES work_runs(id),
+    relevance_count INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_learnings_project ON project_learnings(project_id);
+CREATE INDEX IF NOT EXISTS idx_learnings_category ON project_learnings(category);
 """
