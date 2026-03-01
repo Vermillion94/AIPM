@@ -47,10 +47,6 @@ class WorktreeManager:
         safe_name = branch_name.replace("/", "_").replace("#", "_")
         worktree_path = self.worktrees_dir / safe_name
 
-        if worktree_path.exists():
-            logger.info(f"Worktree already exists: {worktree_path}")
-            return worktree_path
-
         # We need a bare/shared clone to create worktrees from
         shared_repo = self.worktrees_dir / "_shared_repos"
         shared_repo.mkdir(parents=True, exist_ok=True)
@@ -58,6 +54,13 @@ class WorktreeManager:
         # Extract owner/repo from URL or repo string
         repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
         repo_dir = shared_repo / repo_name
+
+        if worktree_path.exists():
+            logger.info(f"Removing stale worktree to recreate from latest: {worktree_path}")
+            await self.cleanup(branch_name)
+            # Delete stale branch ref from bare repo so we get a clean start
+            if repo_dir.exists():
+                await _run_git("branch", "-D", branch_name, cwd=repo_dir)
 
         if not repo_dir.exists():
             logger.info(f"Cloning {repo_url} into {repo_dir}")
