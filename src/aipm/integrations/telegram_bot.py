@@ -9,6 +9,7 @@ from typing import Optional
 from ..config import Settings
 from ..db.models import TaskStatus
 from ..db.store import Store
+from ..github.actions import GitHubActions
 
 logger = logging.getLogger("aipm.integrations.telegram")
 
@@ -22,6 +23,7 @@ class TelegramNotifier:
         self._bot = None
         self._app = None
         self._pause_event: Optional[asyncio.Event] = None
+        self._github_actions: Optional[GitHubActions] = None
 
     @property
     def enabled(self) -> bool:
@@ -34,6 +36,10 @@ class TelegramNotifier:
     def set_pause_event(self, event: asyncio.Event) -> None:
         """Set the shared pause/resume event from the scheduler."""
         self._pause_event = event
+
+    def set_github_actions(self, actions: GitHubActions) -> None:
+        """Set the GitHub actions reference for PR merge/close operations."""
+        self._github_actions = actions
 
     async def initialize(self) -> bool:
         """Initialize the Telegram bot. Returns True if successful."""
@@ -95,6 +101,55 @@ class TelegramNotifier:
             text += "\nQA checks failed — needs attention."
 
         return await self.send_message(text)
+
+    async def notify_pr_ready(
+        self,
+        task_id: str,
+        title: str,
+        pr_number: int,
+        pr_url: str,
+        owner: str,
+        repo: str,
+    ) -> Optional[int]:
+        """Send a PR notification with Merge/Reject inline buttons."""
+        if not self._bot or not self.settings.telegram.chat_id:
+            return None
+
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            buttons = [
+                [
+                    InlineKeyboardButton(
+                        "Merge PR",
+                        callback_data=f"pr_merge:{owner}/{repo}:{pr_number}:{task_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "Reject PR",
+                        callback_data=f"pr_reject:{owner}/{repo}:{pr_number}:{task_id}",
+                    ),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(buttons)
+
+            text = (
+                f"<b>PR Ready for Review</b>\n\n"
+                f"<b>{title}</b>\n"
+                f"PR: <a href=\"{pr_url}\">#{pr_number}</a>\n"
+                f"Repo: {owner}/{repo}\n"
+                f"Task: <code>{task_id}</code>"
+            )
+
+            msg = await self._bot.send_message(
+                chat_id=self.settings.telegram.chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            return msg.message_id
+        except Exception as e:
+            logger.error(f"Failed to send PR ready notification: {e}")
+            return None
 
     async def notify_task_failed(
         self, task_id: str, title: str, error: str
@@ -260,12 +315,14 @@ class TelegramNotifier:
             await update.message.reply_text("Resume not available — scheduler not connected.")
 
     async def _handle_callback(self, update, context) -> None:
-        """Handle inline keyboard button presses for decisions."""
+        """Handle inline keyboard button presses for decisions and PR actions."""
         query = update.callback_query
         await query.answer()
 
         data = query.data
-        if data.startswith("decision:"):
+        if data.startswith("pr_merge:") or data.startswith("pr_reject:"):
+            await self._handle_pr_callback(query, data)
+        elif data.startswith("decision:"):
             parts = data.split(":")
             if len(parts) >= 3:
                 task_id = parts[1]
@@ -316,3 +373,55 @@ class TelegramNotifier:
                     await query.edit_message_text(
                         f"Decision recorded for {task_id}: {choice}"
                     )
+
+    async def _handle_pr_callback(self, query, data: str) -> None:
+        """Handle PR merge/reject button presses."""
+        action = "merge" if data.startswith("pr_merge:") else "reject"
+        parts = data.split(":")
+        # Format: pr_merge:owner/repo:pr_number:task_id
+        if len(parts) < 4:
+            await query.edit_message_text("Invalid callback data.")
+            return
+
+        owner_repo = parts[1]
+        pr_number = int(parts[2])
+        task_id = parts[3]
+
+        if "/" not in owner_repo:
+            await query.edit_message_text("Invalid repo format.")
+            return
+
+        owner, repo = owner_repo.split("/", 1)
+
+        if not self._github_actions:
+            await query.edit_message_text("GitHub actions not available.")
+            return
+
+        if action == "merge":
+            success = await self._github_actions.merge_pull_request(owner, repo, pr_number)
+            if success:
+                await self.store.update_task_status(task_id, TaskStatus.DONE)
+                await query.edit_message_text(
+                    f"PR #{pr_number} merged on {owner}/{repo}.\n"
+                    f"Task {task_id} marked as DONE."
+                )
+            else:
+                await query.edit_message_text(
+                    f"Failed to merge PR #{pr_number} on {owner}/{repo}.\n"
+                    f"Check GitHub for details."
+                )
+        else:
+            success = await self._github_actions.close_pull_request(owner, repo, pr_number)
+            if success:
+                await self.store.update_task_status(task_id, TaskStatus.FAILED)
+                await query.edit_message_text(
+                    f"PR #{pr_number} closed on {owner}/{repo}.\n"
+                    f"Task {task_id} marked as FAILED."
+                )
+            else:
+                await query.edit_message_text(
+                    f"Failed to close PR #{pr_number} on {owner}/{repo}.\n"
+                    f"Check GitHub for details."
+                )
+
+        logger.info(f"PR {action} for #{pr_number} on {owner}/{repo} (task {task_id})")

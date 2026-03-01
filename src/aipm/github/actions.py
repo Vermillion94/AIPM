@@ -101,6 +101,44 @@ class GitHubActions:
             logger.error(f"Failed to add labels to {owner}/{repo}#{issue_number}: {e}")
             return False
 
+    async def merge_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        merge_method: str = "squash",
+    ) -> bool:
+        """Merge a pull request on GitHub."""
+        client = await self._get_client()
+        try:
+            response = await client.put(
+                f"/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+                json={"merge_method": merge_method},
+            )
+            response.raise_for_status()
+            logger.info(f"Merged PR #{pr_number} on {owner}/{repo}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to merge PR #{pr_number} on {owner}/{repo}: {e}")
+            return False
+
+    async def close_pull_request(
+        self, owner: str, repo: str, pr_number: int
+    ) -> bool:
+        """Close a pull request on GitHub."""
+        client = await self._get_client()
+        try:
+            response = await client.patch(
+                f"/repos/{owner}/{repo}/pulls/{pr_number}",
+                json={"state": "closed"},
+            )
+            response.raise_for_status()
+            logger.info(f"Closed PR #{pr_number} on {owner}/{repo}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to close PR #{pr_number} on {owner}/{repo}: {e}")
+            return False
+
     async def push_branch(
         self, repo_path: str, branch_name: str, remote: str = "origin"
     ) -> bool:

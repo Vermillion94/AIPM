@@ -14,13 +14,22 @@ from pydantic import BaseModel, Field
 # --- Pydantic config models ---
 
 
+class DeployConfig(BaseModel):
+    platform: Optional[str] = None       # "render", "fly", "vercel", "self-hosted", etc.
+    service_id: Optional[str] = None     # e.g. "srv-d20p2f15pdvs7399d0o0"
+    dashboard_url: Optional[str] = None  # e.g. "https://dashboard.render.com/web/srv-xxx"
+    logs_url: Optional[str] = None       # e.g. "https://dashboard.render.com/web/srv-xxx/logs"
+    app_url: Optional[str] = None        # e.g. "https://blwebsite.onrender.com"
+    auto_deploys: bool = False           # does merging to default_branch auto-deploy?
+
+
 class ProjectConfig(BaseModel):
     repo: str  # "owner/repo"
     labels: list[str] = Field(default_factory=list)
     priority: int = 5
-    test_command: Optional[str] = None
-    build_command: Optional[str] = None
+    default_branch: str = "main"
     auto_pickup: bool = True
+    deploy: DeployConfig = Field(default_factory=DeployConfig)
 
     @property
     def owner(self) -> str:
@@ -67,6 +76,7 @@ class AipmConfig(BaseModel):
     sync_interval_seconds: int = 300
     work_interval_seconds: int = 60
     max_retries_per_issue: int = 2
+    review_score_threshold: int = 60
 
 
 class Settings(BaseModel):

@@ -44,6 +44,7 @@ class AIPMDaemon:
 
         # Wire Telegram ↔ Scheduler
         self.scheduler.set_telegram(self.telegram)
+        self.telegram.set_github_actions(self.scheduler.github_actions)
 
         # Initialize Telegram and wire pause event
         if self.telegram.enabled:

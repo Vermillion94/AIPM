@@ -144,8 +144,7 @@ class Scheduler:
 
         # 8. Run QA (if work succeeded)
         if run.status == RunStatus.SUCCEEDED:
-            test_command = project.test_command
-            qa_result = await self.qa.run_checks(worktree_path, run, test_command)
+            qa_result = await self.qa.run_checks(worktree_path, run, None)
             summary["qa"] = {
                 "passed": qa_result.passed,
                 "issues": qa_result.issues,
@@ -273,7 +272,7 @@ class Scheduler:
 
             if run.status == RunStatus.SUCCEEDED:
                 qa_result = await self.qa.run_checks(
-                    worktree_path, run, project.test_command
+                    worktree_path, run, None
                 )
                 if qa_result.passed:
                     await self._publish_results(task, run, project, worktree_path, branch_name)
@@ -336,6 +335,9 @@ class Scheduler:
                 await self.store.update_run(
                     run.id, pr_url=pr_url, pr_number=pr_number
                 )
+                # Store on run object for downstream use
+                run.pr_number = pr_number
+                run.pr_url = pr_url
 
                 # Comment on the original issue
                 await self.github_actions.comment_on_issue(
@@ -348,13 +350,54 @@ class Scheduler:
 
                 logger.info(f"Published PR #{pr_number} for task {task.id}")
 
-            # Mark task as DONE
-            await self.store.update_task_status(task.id, TaskStatus.DONE)
+                # Check Render preview if applicable
+                preview = await self._check_render_preview(project, branch_name)
+                if preview:
+                    preview_status = preview.get("status", "unknown")
+                    preview_note = f"\n**Preview:** {preview_status}"
+                    if preview.get("url"):
+                        preview_note += f" — {preview['url']}"
+                    await self.github_actions.comment_on_issue(
+                        owner=project.owner,
+                        repo=project.repo,
+                        issue_number=task.github_number,
+                        body=f"Render preview deploy: {preview_status}{' — ' + preview['url'] if preview.get('url') else ''}",
+                    )
+
+            # Task stays IN_REVIEW until user merges/rejects via Telegram
+            await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
 
         except Exception as e:
             logger.error(f"Failed to publish results for {task.id}: {e}")
             # Still mark as IN_REVIEW so it's not lost
             await self.store.update_task_status(task.id, TaskStatus.IN_REVIEW)
+
+    # --- Render Preview Check (Feature 3) ---
+
+    async def _check_render_preview(
+        self, project, branch_name: str
+    ) -> Optional[dict]:
+        """Check Render PR preview status if the project uses Render with a service_id."""
+        if (
+            not getattr(project, "deploy_platform", None) == "render"
+            or not getattr(project, "deploy_service_id", None)
+        ):
+            return None
+
+        try:
+            from ..integrations.render_client import RenderClient
+
+            client = RenderClient(project.deploy_service_id)
+            result = await client.check_preview_health(branch_name, timeout=120)
+            await client.close()
+            logger.info(
+                f"Render preview for {branch_name}: "
+                f"found={result.get('found')}, status={result.get('status')}"
+            )
+            return result if result.get("found") else None
+        except Exception as e:
+            logger.warning(f"Render preview check failed: {e}")
+            return None
 
     # --- Retry Logic (Gap 4) ---
 
@@ -447,6 +490,20 @@ class Scheduler:
     async def _notify_success(self, task: Task, run: WorkRun) -> None:
         """Notify via Telegram that a task succeeded."""
         if self._telegram:
+            if run.pr_number:
+                # Send PR notification with merge/reject buttons
+                project = await self.store.get_project(task.project_id)
+                if project:
+                    await self._telegram.notify_pr_ready(
+                        task_id=task.id,
+                        title=task.title,
+                        pr_number=run.pr_number,
+                        pr_url=run.pr_url or "",
+                        owner=project.owner,
+                        repo=project.repo,
+                    )
+                    return
+            # Fallback: no PR created
             await self._telegram.notify_task_completed(
                 task_id=task.id,
                 title=task.title,

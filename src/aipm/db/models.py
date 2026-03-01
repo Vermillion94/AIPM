@@ -49,9 +49,13 @@ class Project(BaseModel):
     default_branch: str = "main"
     labels_filter: list[str] = Field(default_factory=list)
     priority_weight: int = 5
-    test_command: Optional[str] = None
-    build_command: Optional[str] = None
     auto_pickup: bool = True
+    deploy_platform: Optional[str] = None
+    deploy_service_id: Optional[str] = None
+    deploy_dashboard_url: Optional[str] = None
+    deploy_logs_url: Optional[str] = None
+    deploy_app_url: Optional[str] = None
+    deploy_auto: bool = False
     last_synced: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -66,9 +70,13 @@ class Project(BaseModel):
             "default_branch": self.default_branch,
             "labels_filter": json.dumps(self.labels_filter),
             "priority_weight": self.priority_weight,
-            "test_command": self.test_command,
-            "build_command": self.build_command,
             "auto_pickup": int(self.auto_pickup),
+            "deploy_platform": self.deploy_platform,
+            "deploy_service_id": self.deploy_service_id,
+            "deploy_dashboard_url": self.deploy_dashboard_url,
+            "deploy_logs_url": self.deploy_logs_url,
+            "deploy_app_url": self.deploy_app_url,
+            "deploy_auto": int(self.deploy_auto),
         }
 
 

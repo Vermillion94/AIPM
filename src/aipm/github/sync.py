@@ -66,9 +66,14 @@ class GitHubSync:
             display_name=project_config.repo,
             labels_filter=project_config.labels,
             priority_weight=project_config.priority,
-            test_command=project_config.test_command,
-            build_command=project_config.build_command,
+            default_branch=project_config.default_branch,
             auto_pickup=project_config.auto_pickup,
+            deploy_platform=project_config.deploy.platform,
+            deploy_service_id=project_config.deploy.service_id,
+            deploy_dashboard_url=project_config.deploy.dashboard_url,
+            deploy_logs_url=project_config.deploy.logs_url,
+            deploy_app_url=project_config.deploy.app_url,
+            deploy_auto=project_config.deploy.auto_deploys,
         )
         await self.store.upsert_project(project)
 
@@ -107,10 +112,6 @@ class GitHubSync:
                 "direction": "desc",
             }
 
-            # Filter by labels if configured
-            if project_config.labels:
-                params["labels"] = ",".join(project_config.labels)
-
             response = await client.get(
                 f"/repos/{owner}/{repo}/issues", params=params
             )
@@ -127,6 +128,15 @@ class GitHubSync:
 
             # Filter out pull requests (GitHub API returns PRs as issues too)
             real_issues = [i for i in issues if "pull_request" not in i]
+
+            # Filter by labels (OR — issue must have at least one configured label)
+            if project_config.labels:
+                allowed = {l.lower() for l in project_config.labels}
+                real_issues = [
+                    i for i in real_issues
+                    if any(l["name"].lower() in allowed for l in i.get("labels", []))
+                ]
+
             all_issues.extend(real_issues)
 
             if len(issues) < per_page:

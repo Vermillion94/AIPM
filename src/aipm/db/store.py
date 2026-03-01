@@ -61,16 +61,23 @@ class Store:
         row = project.to_row()
         await self.db.execute(
             """INSERT INTO projects (id, owner, repo, display_name, is_active,
-               default_branch, labels_filter, priority_weight, test_command,
-               build_command, auto_pickup, created_at, updated_at)
+               default_branch, labels_filter, priority_weight,
+               auto_pickup, deploy_platform, deploy_service_id,
+               deploy_dashboard_url, deploy_logs_url, deploy_app_url,
+               deploy_auto, created_at, updated_at)
                VALUES (:id, :owner, :repo, :display_name, :is_active,
-               :default_branch, :labels_filter, :priority_weight, :test_command,
-               :build_command, :auto_pickup, :created_at, :updated_at)
+               :default_branch, :labels_filter, :priority_weight,
+               :auto_pickup, :deploy_platform, :deploy_service_id,
+               :deploy_dashboard_url, :deploy_logs_url, :deploy_app_url,
+               :deploy_auto, :created_at, :updated_at)
                ON CONFLICT(id) DO UPDATE SET
                display_name=:display_name, is_active=:is_active,
                labels_filter=:labels_filter, priority_weight=:priority_weight,
-               test_command=:test_command, build_command=:build_command,
-               auto_pickup=:auto_pickup, updated_at=:updated_at""",
+               auto_pickup=:auto_pickup, deploy_platform=:deploy_platform,
+               deploy_service_id=:deploy_service_id,
+               deploy_dashboard_url=:deploy_dashboard_url,
+               deploy_logs_url=:deploy_logs_url, deploy_app_url=:deploy_app_url,
+               deploy_auto=:deploy_auto, updated_at=:updated_at""",
             {**row, "created_at": _now(), "updated_at": _now()},
         )
         await self.db.commit()
@@ -407,6 +414,7 @@ class Store:
         d = dict(row)
         d["is_active"] = bool(d.get("is_active", 1))
         d["auto_pickup"] = bool(d.get("auto_pickup", 1))
+        d["deploy_auto"] = bool(d.get("deploy_auto", 0))
         d["labels_filter"] = json.loads(d.get("labels_filter", "[]"))
         return Project(**d)
 

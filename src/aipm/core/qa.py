@@ -11,6 +11,8 @@ from typing import Optional
 from ..config import Settings
 from ..db.models import WorkRun
 from ..db.store import Store
+from ..integrations.anthropic_client import AnthropicClient
+from ..prompts.review import build_code_review_prompt
 
 logger = logging.getLogger("aipm.core.qa")
 
@@ -59,10 +61,74 @@ class QARunner:
             result.issues.append("No changes were made")
             logger.warning(f"No changes in worktree for run {run.id}")
 
-        # 3. Code review (via Opus) — optional, can be enabled later
-        # This will be implemented in Phase 3
+        # 3. Code review (via Opus)
+        review = await self._run_code_review(worktree_path, run)
+        if review:
+            result.review_score = review.get("score")
+            result.review_summary = review.get("summary", "")
+            if not review.get("approved", True):
+                result.passed = False
+                result.issues.append(
+                    f"Code review failed (score {review.get('score')}): "
+                    f"{review.get('summary')}"
+                )
 
         return result
+
+    async def _run_code_review(
+        self, worktree_path: Path, run: WorkRun
+    ) -> Optional[dict]:
+        """Run AI code review on the changes. Returns review dict or None."""
+        try:
+            # Get the diff
+            diff_result = await self._run_command("git diff HEAD~1", worktree_path)
+            if diff_result["returncode"] != 0 or not diff_result["output"].strip():
+                logger.info(f"No diff available for code review (run {run.id})")
+                return None
+
+            # Load task context
+            task = await self.store.get_task(run.task_id)
+            title = task.title if task else ""
+            body = task.body if task else ""
+
+            # Build the review prompt
+            prompt = build_code_review_prompt(
+                issue_title=title,
+                issue_body=body,
+                diff=diff_result["output"],
+                test_output="",
+            )
+
+            # Call the review model
+            client = AnthropicClient(self.settings)
+            review = client.review_code(prompt)
+
+            # Record API cost
+            from .budget import BudgetTracker
+
+            estimated_cost = BudgetTracker.estimate_cost(
+                self.settings.models.review,
+                tokens_in=len(prompt) // 4,
+                tokens_out=256,
+            )
+            await self.store.record_credit(
+                run_id=run.id,
+                model=self.settings.models.review,
+                source="api",
+                tokens_in=len(prompt) // 4,
+                tokens_out=256,
+                cost_usd=estimated_cost,
+            )
+
+            logger.info(
+                f"Code review for run {run.id}: "
+                f"score={review.get('score')}, approved={review.get('approved')}"
+            )
+            return review
+
+        except Exception as e:
+            logger.error(f"Code review failed for run {run.id}: {e}")
+            return None
 
     def _detect_test_command(self, worktree_path: Path) -> Optional[str]:
         """Auto-detect the test command based on project files."""
