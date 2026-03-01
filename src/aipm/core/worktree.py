@@ -59,9 +59,10 @@ class WorktreeManager:
         if worktree_path.exists():
             logger.info(f"Removing stale worktree to recreate from latest: {worktree_path}")
             await self.cleanup(branch_name)
-            # Delete stale branch ref from bare repo so we get a clean start
+            # Delete stale local + remote branch refs so we get a clean start
             if repo_dir.exists():
                 await _run_git("branch", "-D", branch_name, cwd=repo_dir)
+                await _run_git("push", "origin", "--delete", branch_name, cwd=repo_dir)
 
         if not repo_dir.exists():
             logger.info(f"Cloning {repo_url} into {repo_dir}")
