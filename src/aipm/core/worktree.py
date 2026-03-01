@@ -43,9 +43,10 @@ class WorktreeManager:
 
         Returns the worktree path, or None on failure.
         """
-        # Sanitize task_id for directory name
+        # Sanitize task_id for directory name — use absolute path so git
+        # worktree add resolves correctly regardless of cwd
         safe_name = branch_name.replace("/", "_").replace("#", "_")
-        worktree_path = self.worktrees_dir / safe_name
+        worktree_path = (self.worktrees_dir / safe_name).resolve()
 
         # We need a bare/shared clone to create worktrees from
         shared_repo = self.worktrees_dir / "_shared_repos"
@@ -108,7 +109,7 @@ class WorktreeManager:
     ) -> Optional[Path]:
         """Create a worktree from an existing local repo clone."""
         safe_name = branch_name.replace("/", "_").replace("#", "_")
-        worktree_path = self.worktrees_dir / safe_name
+        worktree_path = (self.worktrees_dir / safe_name).resolve()
 
         if worktree_path.exists():
             return worktree_path
@@ -136,7 +137,7 @@ class WorktreeManager:
     async def cleanup(self, branch_name: str) -> bool:
         """Remove a worktree by branch name."""
         safe_name = branch_name.replace("/", "_").replace("#", "_")
-        worktree_path = self.worktrees_dir / safe_name
+        worktree_path = (self.worktrees_dir / safe_name).resolve()
 
         if not worktree_path.exists():
             return True
