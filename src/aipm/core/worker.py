@@ -13,6 +13,7 @@ from ..config import Settings
 from ..db.models import RunStatus, Task, TaskStatus, WorkRun
 from ..db.store import Store
 from ..prompts.coding import build_coding_prompt, build_retry_prompt
+from ..prompts.wiki import format_wiki_for_prompt
 from .budget import BudgetTracker
 
 logger = logging.getLogger("aipm.core.worker")
@@ -60,6 +61,10 @@ class Worker:
                 f"- [{lr.category.value}] {lr.content}" for lr in learnings
             )
 
+        # Fetch project wiki
+        wiki_sections = await self.store.get_wiki_sections(task.project_id)
+        wiki_text = format_wiki_for_prompt(wiki_sections)
+
         # Build the prompt
         prompt = build_coding_prompt(
             issue_number=task.github_number,
@@ -69,6 +74,7 @@ class Worker:
             labels=task.labels,
             approach=approach,
             learnings=learnings_text,
+            wiki=wiki_text,
         )
 
         # Check for previous failed runs and inject retry context

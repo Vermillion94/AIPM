@@ -70,6 +70,39 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             },
         )
 
+    @app.get("/projects/{project_id:path}/wiki", response_class=HTMLResponse)
+    async def project_wiki(request: Request, project_id: str):
+        """Wiki view for a project."""
+        project = await store.get_project(project_id)
+        if not project:
+            return HTMLResponse("<h1>Project not found</h1>", status_code=404)
+
+        sections = await store.get_wiki_sections(project_id)
+        return templates.TemplateResponse(
+            "wiki.html",
+            {
+                "request": request,
+                "project": project,
+                "sections": sections,
+            },
+        )
+
+    @app.get("/api/projects/{project_id:path}/wiki")
+    async def api_project_wiki(project_id: str):
+        """Get wiki sections as JSON."""
+        sections = await store.get_wiki_sections(project_id)
+        return [
+            {
+                "id": s.id,
+                "title": s.title,
+                "content": s.content,
+                "section_order": s.section_order,
+                "created_at": str(s.created_at) if s.created_at else None,
+                "updated_at": str(s.updated_at) if s.updated_at else None,
+            }
+            for s in sections
+        ]
+
     @app.get("/tasks/{task_id:path}", response_class=HTMLResponse)
     async def task_detail(request: Request, task_id: str):
         """Task detail view with run history."""

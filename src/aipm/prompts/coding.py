@@ -7,6 +7,12 @@ def _learnings_section(learnings: str) -> str:
     return f"## Project Notes\n{learnings}\n\n"
 
 
+def _wiki_section(wiki: str) -> str:
+    if not wiki:
+        return ""
+    return f"## Project Wiki\n{wiki}\n\n"
+
+
 def build_coding_prompt(
     issue_number: int,
     project_repo: str,
@@ -15,6 +21,7 @@ def build_coding_prompt(
     labels: list[str],
     approach: str = "",
     learnings: str = "",
+    wiki: str = "",
 ) -> str:
     """Build the main coding prompt for a worker agent."""
     labels_str = ", ".join(labels) if labels else "none"
@@ -38,7 +45,7 @@ Follow this guidance unless you identify a clearly better alternative.
 **Description:**
 {body}
 
-{approach_section}{_learnings_section(learnings)}## Instructions
+{approach_section}{_wiki_section(wiki)}{_learnings_section(learnings)}## Instructions
 
 1. **Understand the issue**: Read the relevant source code to fully understand the context and requirements.
 2. **Implement the fix/feature**: Make the minimum necessary changes to resolve the issue correctly.

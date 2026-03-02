@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Optional
 
@@ -298,6 +299,8 @@ class TelegramNotifier:
             app.add_handler(CommandHandler("status", self._cmd_status))
             app.add_handler(CommandHandler("pause", self._cmd_pause))
             app.add_handler(CommandHandler("resume", self._cmd_resume))
+            app.add_handler(CommandHandler("wiki", self._cmd_wiki))
+            app.add_handler(CommandHandler("wikiedit", self._cmd_wikiedit))
 
             # Callback handler for inline keyboard buttons
             app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -393,6 +396,35 @@ class TelegramNotifier:
                     f"Decision resolved for task {task_id}: {choice}"
                 )
 
+                # Check for wiki edit/delete context
+                if decision.context:
+                    try:
+                        ctx = json.loads(decision.context)
+                        action = ctx.get("action")
+                        if action in ("edit", "delete"):
+                            if choice == "Approve":
+                                if action == "edit":
+                                    await self.store.update_wiki_section(
+                                        ctx["section_id"],
+                                        ctx["new_content"],
+                                        source_run_id=ctx.get("source_run_id"),
+                                    )
+                                    await query.edit_message_text(
+                                        "Wiki section updated (approved)."
+                                    )
+                                elif action == "delete":
+                                    await self.store.delete_wiki_section(ctx["section_id"])
+                                    await query.edit_message_text(
+                                        "Wiki section deleted (approved)."
+                                    )
+                            else:
+                                await query.edit_message_text(
+                                    f"Wiki {action} rejected."
+                                )
+                            return
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
                 # Handle the decision outcome
                 if choice in ("Approve", "Retry with different model"):
                     # Re-queue the task to BACKLOG for processing
@@ -417,6 +449,84 @@ class TelegramNotifier:
                     await query.edit_message_text(
                         f"Decision recorded for {task_id}: {choice}"
                     )
+
+    async def _cmd_wiki(self, update, context) -> None:
+        """Handle /wiki [project_id] — view wiki sections."""
+        args = context.args
+        if not args:
+            # List projects
+            projects = await self.store.get_projects()
+            if not projects:
+                await update.message.reply_text("No projects found.")
+                return
+            lines = ["<b>Projects with Wiki</b>\n"]
+            for p in projects:
+                sections = await self.store.get_wiki_sections(p.id)
+                lines.append(f"  <code>{p.id}</code> — {len(sections)} sections")
+            await update.message.reply_html("\n".join(lines))
+            return
+
+        project_id = args[0]
+        sections = await self.store.get_wiki_sections(project_id)
+        if not sections:
+            await update.message.reply_text(f"No wiki sections for {project_id}.")
+            return
+
+        text = f"<b>Wiki: {project_id}</b>\n\n"
+        for s in sections:
+            content_preview = s.content[:200]
+            if len(s.content) > 200:
+                content_preview += "..."
+            text += f"<b>{s.title}</b>\n{content_preview}\n\n"
+
+        # Telegram has a 4096 char limit
+        if len(text) > 4000:
+            text = text[:4000] + "\n...(truncated)"
+        await update.message.reply_html(text)
+
+    async def _cmd_wikiedit(self, update, context) -> None:
+        """Handle /wikiedit project_id | Title | Content — add or edit a wiki section."""
+        raw = update.message.text
+        # Strip the /wikiedit command prefix
+        _, _, payload = raw.partition(" ")
+        if not payload or payload.count("|") < 2:
+            await update.message.reply_text(
+                "Usage: /wikiedit project_id | Title | Content"
+            )
+            return
+
+        parts = payload.split("|", 2)
+        project_id = parts[0].strip()
+        title = parts[1].strip()
+        content = parts[2].strip()
+
+        if not project_id or not title or not content:
+            await update.message.reply_text(
+                "All three fields are required: project_id | Title | Content"
+            )
+            return
+
+        # Check if section exists
+        existing = await self.store.get_wiki_section_by_title(project_id, title)
+        if existing:
+            # Human-initiated edit — auto-approved
+            await self.store.update_wiki_section(existing.id, content)
+            await update.message.reply_html(
+                f"Wiki section '<b>{title}</b>' updated for {project_id}."
+            )
+        else:
+            # Add new section
+            section_id = await self.store.add_wiki_section(
+                project_id=project_id, title=title, content=content,
+            )
+            if section_id:
+                await update.message.reply_html(
+                    f"Wiki section '<b>{title}</b>' added to {project_id}."
+                )
+            else:
+                await update.message.reply_text(
+                    "Failed to add section (may already exist)."
+                )
 
     async def _handle_pr_callback(self, query, data: str) -> None:
         """Handle PR merge/reject button presses."""

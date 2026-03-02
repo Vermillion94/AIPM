@@ -135,4 +135,17 @@ CREATE TABLE IF NOT EXISTS model_performance (
 );
 CREATE INDEX IF NOT EXISTS idx_model_perf_project ON model_performance(project_id);
 CREATE INDEX IF NOT EXISTS idx_model_perf_model ON model_performance(model_used, task_type);
+
+CREATE TABLE IF NOT EXISTS project_wiki_sections (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    section_order INTEGER DEFAULT 0,
+    source_run_id TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_wiki_project ON project_wiki_sections(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wiki_project_title ON project_wiki_sections(project_id, title);
 """

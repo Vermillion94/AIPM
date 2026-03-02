@@ -217,6 +217,27 @@ class ProjectLearning(BaseModel):
         }
 
 
+class WikiSection(BaseModel):
+    id: str
+    project_id: str
+    title: str
+    content: str
+    section_order: int = 0
+    source_run_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    def to_row(self) -> dict:
+        return {
+            "id": self.id,
+            "project_id": self.project_id,
+            "title": self.title,
+            "content": self.content,
+            "section_order": self.section_order,
+            "source_run_id": self.source_run_id,
+        }
+
+
 class PipelineStep(BaseModel):
     id: str
     run_id: str

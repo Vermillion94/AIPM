@@ -25,6 +25,7 @@ from ..config import DevEnvConfig, Settings
 from ..db.models import WorkRun
 from ..db.store import Store
 from ..prompts.review import build_code_review_prompt, classify_change_type
+from ..prompts.wiki import format_wiki_for_prompt
 from .site_reviewer import crawl_site, html_to_text
 
 logger = logging.getLogger("aipm.core.qa")
@@ -139,6 +140,12 @@ class QARunner:
                         f"- [{lr.category.value}] {lr.content}" for lr in learnings
                     )
 
+            # Fetch project wiki for review context
+            wiki_text = ""
+            if task:
+                wiki_sections = await self.store.get_wiki_sections(task.project_id)
+                wiki_text = format_wiki_for_prompt(wiki_sections, max_chars=3000)
+
             # Build the review prompt
             prompt = build_code_review_prompt(
                 issue_title=title,
@@ -151,6 +158,7 @@ class QARunner:
                 labels=labels,
                 live_site_content=visual.get("live_content", ""),
                 learnings=learnings_text,
+                wiki=wiki_text,
             )
 
             # Call review via Claude CLI (uses subscription, not API tokens)

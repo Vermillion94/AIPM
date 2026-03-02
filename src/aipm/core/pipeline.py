@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Optional
 
 from ..config import Settings
 from ..db.models import (
+    Decision,
     LearningCategory,
     PipelineStep,
     PipelineStepName,
@@ -379,7 +381,7 @@ class PipelineRunner:
         all_gates_passed: bool,
         qa_result=None,
     ) -> None:
-        """DOCUMENT step — always runs. Records learnings + model performance."""
+        """DOCUMENT step — always runs. Records learnings + model performance + wiki."""
         step = step_map[PipelineStepName.DOCUMENT]
         await self._mark_step(step, PipelineStepStatus.RUNNING)
         try:
@@ -419,11 +421,86 @@ class PipelineRunner:
                     source_run_id=run.id,
                 )
 
+            # Update wiki on successful runs
+            if all_gates_passed:
+                await self._update_wiki_from_run(task, run, project, qa_result)
+
             await self._mark_step(step, PipelineStepStatus.PASSED,
-                                  output_summary="Documented: model_perf + learnings recorded")
+                                  output_summary="Documented: model_perf + learnings + wiki recorded")
         except Exception as e:
             logger.error(f"DOCUMENT step failed: {e}")
             await self._mark_step(step, PipelineStepStatus.FAILED, output_summary=str(e)[:500])
+
+    async def _update_wiki_from_run(
+        self, task: Task, run: WorkRun, project, qa_result=None,
+    ) -> None:
+        """Update wiki sections based on a successful run."""
+        try:
+            sections = await self.store.get_wiki_sections(task.project_id)
+
+            # Bootstrap: if wiki is empty, add an Overview section
+            if not sections:
+                repo_name = f"{project.owner}/{project.repo}" if project else task.project_id
+                await self.store.add_wiki_section(
+                    project_id=task.project_id,
+                    title="Overview",
+                    content=f"Repository: {repo_name}",
+                    source_run_id=run.id,
+                )
+                logger.info(f"Wiki bootstrapped for {task.project_id}")
+
+            # If QA has praise, auto-add a Conventions section if it doesn't exist
+            if qa_result and qa_result.review_raw:
+                praise_list = qa_result.review_raw.get("praise", [])
+                if praise_list:
+                    existing = await self.store.get_wiki_section_by_title(
+                        task.project_id, "Conventions",
+                    )
+                    if not existing:
+                        conventions = "\n".join(f"- {p}" for p in praise_list if p)
+                        if conventions:
+                            await self.store.add_wiki_section(
+                                project_id=task.project_id,
+                                title="Conventions",
+                                content=conventions,
+                                source_run_id=run.id,
+                            )
+                            logger.info(f"Wiki 'Conventions' section added for {task.project_id}")
+        except Exception as e:
+            logger.error(f"Wiki update failed for {task.project_id}: {e}")
+
+    async def _propose_wiki_edit(
+        self,
+        project_id: str,
+        section_id: str,
+        section_title: str,
+        new_content: str,
+        source_run_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Propose an edit to an existing wiki section via Decision approval flow."""
+        ctx = json.dumps({
+            "action": "edit",
+            "section_id": section_id,
+            "new_content": new_content,
+            "source_run_id": source_run_id,
+        })
+        decision = Decision(
+            id="",
+            task_id=f"wiki__{section_id}",
+            question=f"Approve wiki edit to '{section_title}' in {project_id}?",
+            context=ctx,
+            options=["Approve", "Reject"],
+        )
+        decision_id = await self.store.create_decision(decision)
+
+        if self._telegram:
+            await self._telegram.notify_decision_needed(
+                task_id=f"wiki__{section_id}",
+                title=f"Wiki Edit: {section_title}",
+                question=f"Approve edit to wiki section '{section_title}'?\n\nNew content preview:\n{new_content[:300]}",
+                options=["Approve", "Reject"],
+            )
+        return decision_id
 
     # ── Helpers ──────────────────────────────────────────────────────────
 

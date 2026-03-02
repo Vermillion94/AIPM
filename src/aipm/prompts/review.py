@@ -76,6 +76,7 @@ def build_code_review_prompt(
     labels: list[str] | None = None,
     live_site_content: str = "",
     learnings: str = "",
+    wiki: str = "",
 ) -> str:
     """Build a code review prompt for Opus."""
     diff_truncated = diff[:12000] if len(diff) > 12000 else diff
@@ -120,12 +121,16 @@ those problems should be scored favorably even if it removes code.
 ```
 """
 
+    wiki_section = ""
+    if wiki:
+        wiki_section = f"\n## Project Wiki\n{wiki}\n"
+
     learnings_section = ""
     if learnings:
         learnings_section = f"\n## Known Project Patterns\n{learnings}\n"
 
     return f"""Review this code change for the following issue.
-{project_section}{change_type_section}{learnings_section}
+{project_section}{change_type_section}{wiki_section}{learnings_section}
 ## Issue
 **Title:** {issue_title}
 **Description:** {issue_body[:4000]}

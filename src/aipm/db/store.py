@@ -22,6 +22,7 @@ from .models import (
     RunStatus,
     Task,
     TaskStatus,
+    WikiSection,
     WorkRun,
 )
 from .schema import SCHEMA_SQL
@@ -623,6 +624,92 @@ class Store:
             "avg_score": row["avg_score"],
         }
 
+    # --- Project Wiki ---
+
+    async def add_wiki_section(
+        self,
+        project_id: str,
+        title: str,
+        content: str,
+        source_run_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Add a wiki section. Returns ID or None if title already exists."""
+        async with self.db.execute(
+            "SELECT id FROM project_wiki_sections WHERE project_id = ? AND title = ?",
+            (project_id, title),
+        ) as cursor:
+            if await cursor.fetchone():
+                return None
+        section_id = _new_id()
+        now = _now()
+        # Get next section_order
+        async with self.db.execute(
+            "SELECT COALESCE(MAX(section_order), -1) + 1 as next_order FROM project_wiki_sections WHERE project_id = ?",
+            (project_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        next_order = row["next_order"] if row else 0
+        await self.db.execute(
+            """INSERT INTO project_wiki_sections (id, project_id, title, content, section_order, source_run_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (section_id, project_id, title, content, next_order, source_run_id, now, now),
+        )
+        await self.db.commit()
+        return section_id
+
+    async def update_wiki_section(
+        self,
+        section_id: str,
+        content: str,
+        source_run_id: Optional[str] = None,
+    ) -> None:
+        """Update a wiki section's content. Called only after approval."""
+        updates = ["content = ?", "updated_at = ?"]
+        params: list = [content, _now()]
+        if source_run_id is not None:
+            updates.append("source_run_id = ?")
+            params.append(source_run_id)
+        params.append(section_id)
+        await self.db.execute(
+            f"UPDATE project_wiki_sections SET {', '.join(updates)} WHERE id = ?", params,
+        )
+        await self.db.commit()
+
+    async def delete_wiki_section(self, section_id: str) -> None:
+        """Delete a wiki section. Called only after approval."""
+        await self.db.execute(
+            "DELETE FROM project_wiki_sections WHERE id = ?", (section_id,),
+        )
+        await self.db.commit()
+
+    async def get_wiki_sections(self, project_id: str) -> list[WikiSection]:
+        """Get all wiki sections for a project, ordered by section_order ASC."""
+        async with self.db.execute(
+            "SELECT * FROM project_wiki_sections WHERE project_id = ? ORDER BY section_order ASC",
+            (project_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_wiki_section(r) for r in rows]
+
+    async def get_wiki_section(self, section_id: str) -> Optional[WikiSection]:
+        """Get a single wiki section by ID."""
+        async with self.db.execute(
+            "SELECT * FROM project_wiki_sections WHERE id = ?", (section_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_wiki_section(row) if row else None
+
+    async def get_wiki_section_by_title(
+        self, project_id: str, title: str,
+    ) -> Optional[WikiSection]:
+        """Get a wiki section by project and title."""
+        async with self.db.execute(
+            "SELECT * FROM project_wiki_sections WHERE project_id = ? AND title = ?",
+            (project_id, title),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_wiki_section(row) if row else None
+
     # --- Row converters ---
 
     @staticmethod
@@ -653,6 +740,10 @@ class Store:
     @staticmethod
     def _row_to_learning(row: aiosqlite.Row) -> ProjectLearning:
         return ProjectLearning(**dict(row))
+
+    @staticmethod
+    def _row_to_wiki_section(row: aiosqlite.Row) -> WikiSection:
+        return WikiSection(**dict(row))
 
     @staticmethod
     def _row_to_pipeline_step(row: aiosqlite.Row) -> PipelineStep:
